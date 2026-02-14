@@ -5,9 +5,113 @@ from shapely.ops import unary_union
 from shapely.geometry import MultiPolygon, GeometryCollection
 from matplotlib.collections import PolyCollection
 
-# ----------------------------
-# Plot helpers
-# ----------------------------
+def plot_lattice_graph_true_width(
+    g,
+    *,
+    x_attr="x",
+    y_attr="y",
+    thickness_attr="thickness",          # nominal/bulk (W)
+    thickness_eff_attr="thickness_eff",  # optional: polygon-derived / boundary-truncated
+    use_effective=False,
+    invert_y=False,
+    frame_shape=None,
+    node_size=8,
+    edge_color="black",
+    node_color="red",
+    edge_alpha=1.0,
+):
+    """
+    Plot an igraph graph by drawing each edge as a rectangle with *true* thickness.
+
+    Intended for your square-lattice output:
+      - vertices: x, y
+      - edges: thickness (bulk), optional thickness_eff (boundary may differ), optional length
+
+    Parameters
+    ----------
+    sample : str
+        Title.
+    g : igraph.Graph
+        Graph.
+    x_attr, y_attr : str
+        Vertex coordinate attributes.
+    thickness_attr : str
+        Edge thickness attribute (nominal).
+    thickness_eff_attr : str
+        Alternative thickness attribute (effective).
+    use_effective : bool
+        If True, use thickness_eff_attr when available; else use thickness_attr.
+    invert_y : bool
+        If True, reverse y-axis (image convention).
+    frame_shape : (H,W) or None
+        If provided, set axis limits to (0..W, 0..H) (and invert_y if requested).
+    """
+    # --- validate attrs ---
+    if x_attr not in g.vs.attributes() or y_attr not in g.vs.attributes():
+        raise ValueError(f"Graph must have vertex attrs '{x_attr}', '{y_attr}'.")
+
+    use_eff = bool(use_effective and thickness_eff_attr in g.es.attributes())
+    w_attr = thickness_eff_attr if use_eff else thickness_attr
+    if w_attr not in g.es.attributes():
+        raise ValueError(f"Graph must have edge attr '{w_attr}' (and/or '{thickness_attr}').")
+
+    pts = np.column_stack([g.vs[x_attr], g.vs[y_attr]]).astype(float)
+    widths = np.asarray(g.es[w_attr], dtype=float)
+
+    fig, ax = plt.subplots()
+
+    # --- draw edges as rectangles ---
+    for i, e in enumerate(g.es):
+        w = float(widths[i])
+        if not np.isfinite(w) or w <= 0:
+            continue
+
+        u, v = e.source, e.target
+        x0, y0 = pts[u]
+        x1, y1 = pts[v]
+
+        dx, dy = x1 - x0, y1 - y0
+        L = float(np.hypot(dx, dy))
+        if L <= 1e-12:
+            continue
+
+        nx, ny = -dy / L, dx / L  # unit normal
+        hw = 0.5 * w
+
+        poly = np.array([
+            [x0 + nx * hw, y0 + ny * hw],
+            [x0 - nx * hw, y0 - ny * hw],
+            [x1 - nx * hw, y1 - ny * hw],
+            [x1 + nx * hw, y1 + ny * hw],
+        ])
+        ax.fill(poly[:, 0], poly[:, 1], color=edge_color, alpha=edge_alpha, linewidth=0, zorder=1)
+        # ax.fill(poly[:, 0], poly[:, 1], alpha=edge_alpha, linewidth=0, zorder=1) ##debugging: each edge in its own color
+
+
+    # --- nodes ---
+    ax.scatter(pts[:, 0], pts[:, 1], color=node_color, s=node_size, zorder=2)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(x_attr)
+    ax.set_ylabel(y_attr)
+
+    # --- limits / y inversion ---
+    if frame_shape is not None:
+        H, W = frame_shape
+        ax.set_xlim(0, W)
+        if invert_y:
+            ax.set_ylim(H, 0)
+        else:
+            ax.set_ylim(0, H)
+    else:
+        if invert_y:
+            y0, y1 = ax.get_ylim()
+            ax.set_ylim(max(y0, y1), min(y0, y1))
+
+    # plt.show()
+
+
+
 def plot_points(rect, pts, title):
     fig, ax = plt.subplots(figsize=(10, 4))
     x, y = rect.exterior.xy
@@ -133,5 +237,5 @@ def plot_material(
         ax.set_ylabel("y")
 
     plt.tight_layout()
-    # plt.show()
+    plt.show()
     return ax
