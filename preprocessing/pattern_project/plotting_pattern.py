@@ -237,5 +237,5 @@ def plot_material(
         ax.set_ylabel("y")
 
     plt.tight_layout()
-    plt.show()
+    # plt.show()
     return ax

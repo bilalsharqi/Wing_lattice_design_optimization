@@ -9,17 +9,174 @@ def _bar(p0, p1, w, dom=None):
     g = LineString([p0, p1]).buffer(w / 2, cap_style=2, join_style=2)
     return g if dom is None else g.intersection(dom)
 
+def generate_vertical_struts(
+    Lx, Ly, N=7, *, frame=True, W_frame=0.02
+):
+    """
+    Build N vertical struts spanning full height, all with thickness = W_frame.
 
-def generate_vertical_struts(Lx, Ly, N=7, w=0.02, *, frame=True, w_frame=None):
-    Lx, Ly, w = float(Lx), float(Ly), float(w)
-    w_frame = w if w_frame is None else float(w_frame)
-    dom = box(0, 0, Lx, Ly)
+    Geometry outputs:
+      - Polygons:
+          * vertical bars (N of them), thickness=W_frame
+          * if frame=True: exact frame ring = outer rect minus inner rect (thickness=W_frame)
+          * if frame=False: add ONLY top+bottom boundary bars (thickness=W_frame)
+            so you still get "up/down" polygons to weld the struts.
 
-    xs = np.linspace(0, Lx, N + 2)[1:-1] if N > 0 else np.array([])
+      - Graph:
+          * vertical strut edges, thickness=W_frame
+          * if frame=True: frame skeleton = INNER perimeter rectangle (offset by W_frame)
+          * if frame=False: add ONLY top+bottom boundary polyline edges (on y=0 and y=Ly)
 
+    Returns
+    -------
+    polys : list[shapely geometry]
+    meta  : dict
+    G     : igraph.Graph
+    """
+
+    Lx, Ly = float(Lx), float(Ly)
+    W_frame = float(W_frame)
+    dom = box(0.0, 0.0, Lx, Ly)
+    A_dom = Lx * Ly
+
+    xs = np.linspace(0, Lx, N + 2)[1:-1] if int(N) > 0 else np.array([])
+
+    # shared vertices: bottom/top endpoints at strut x-positions + corners
     bottom = [(0.0, 0.0)] + [(float(x), 0.0) for x in xs] + [(Lx, 0.0)]
     top    = [(0.0, Ly)]  + [(float(x), Ly)  for x in xs] + [(Lx, Ly)]
+    bottom.sort(key=lambda p: p[0])
+    top.sort(key=lambda p: p[0])
 
+    V = []
+    for p in bottom + top:
+        if p not in V:
+            V.append(p)
+
+    vid = {p: i for i, p in enumerate(V)}
+    vx = [p[0] for p in V]
+    vy = [p[1] for p in V]
+
+    # exact frame ring polygon (optional)
+    frame_poly = None
+    inner_rect = None
+    if frame and W_frame > 0:
+        if (Lx - 2 * W_frame) <= 0 or (Ly - 2 * W_frame) <= 0:
+            frame_poly = dom
+            inner_rect = None
+        else:
+            inner_rect = box(W_frame, W_frame, Lx - W_frame, Ly - W_frame)
+            frame_poly = dom.difference(inner_rect)
+
+    edges, lengths, ths = [], [], []
+
+    def add(p0, p1, wt):
+        # p0/p1 can be new; add on demand
+        if p0 not in vid:
+            vid[p0] = len(vx)
+            vx.append(float(p0[0])); vy.append(float(p0[1]))
+        if p1 not in vid:
+            vid[p1] = len(vx)
+            vx.append(float(p1[0])); vy.append(float(p1[1]))
+        u, v = vid[p0], vid[p1]
+        if u == v:
+            return
+        edges.append((u, v))
+        lengths.append(float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])))
+        ths.append(float(wt))
+
+    w = W_frame
+
+    # vertical struts (full height)
+    for x in xs:
+        add((float(x), 0.0), (float(x), Ly), w)
+
+    # frame graph
+    if frame and (frame_poly is not None) and (inner_rect is not None):
+        # INNER perimeter skeleton (consistent with your other generators)
+        xmin, ymin = W_frame, W_frame
+        xmax, ymax = Lx - W_frame, Ly - W_frame
+        add((xmin, ymin), (xmax, ymin), w)
+        add((xmax, ymin), (xmax, ymax), w)
+        add((xmax, ymax), (xmin, ymax), w)
+        add((xmin, ymax), (xmin, ymin), w)
+    else:
+        # boundary "up/down" only (so struts weld into top/bottom rails)
+        for a, b in zip(bottom[:-1], bottom[1:]):
+            add(a, b, w)
+        for a, b in zip(top[:-1], top[1:]):
+            add(a, b, w)
+
+    # build graph
+    G = ig.Graph(n=len(vx), edges=edges, directed=False)
+    G.vs["x"], G.vs["y"] = vx, vy
+    G.es["length"], G.es["thickness"] = lengths, ths
+
+    # polygons: vertical bars + (frame ring) OR (top/bottom bars)
+    polys = []
+    for x in xs:
+        polys.append(_bar((float(x), 0.0), (float(x), Ly), w, dom))
+
+    if frame and (frame_poly is not None):
+        polys.append(frame_poly)
+    else:
+        # explicit top/bottom polygons with thickness w (clipped to dom)
+        polys.append(_bar((0.0, 0.0), (Lx, 0.0), w, dom))   # bottom rail
+        polys.append(_bar((0.0, Ly),  (Lx, Ly),  w, dom))   # top rail
+
+    polys = [p for p in polys if (p is not None and not p.is_empty)]
+
+    if polys and A_dom > 0:
+        u = unary_union(polys)
+        A_fill = float(u.area)
+        phi = A_fill / A_dom
+    else:
+        A_fill = 0.0
+        phi = 0.0
+
+    meta = dict(
+        Lx=Lx, Ly=Ly, N=int(N), W_frame=W_frame, frame=bool(frame),
+        phi=float(phi), A_fill=float(A_fill),
+        graph_n=int(G.vcount()), graph_m=int(G.ecount()),
+    )
+    return polys, meta, G
+def generate_vertical_struts_old(Lx, Ly, N=7, *, phi_target=0.05, frame=True, W_frame=0.02):
+    """
+    Vertical struts inside a rectangular frame.
+
+    - Frame thickness is CONSTANT: W_frame
+    - Only INNER strut thickness is adjusted to meet phi_target
+    - Frame is included in BOTH the polygons and the graph
+    """
+    Lx, Ly = float(Lx), float(Ly)
+    W_frame = float(W_frame)
+    dom = box(0, 0, Lx, Ly)
+
+    # inner strut x-locations (exclude boundaries)
+    xs = np.linspace(0, Lx, N + 2)[1:-1] if N > 0 else np.array([])
+
+    # ---- solve w_inner from area fraction phi_target ----
+    A_dom = Lx * Ly
+    if frame:
+        # 4 bars, subtract the four W^2 corner overlaps
+        A_frame = 2.0 * W_frame * (Lx + Ly) - 4.0 * (W_frame ** 2)
+        A_frame = max(0.0, min(A_frame, A_dom))
+    else:
+        A_frame = 0.0
+
+    A_target = float(phi_target) * A_dom
+    A_inner_target = A_target - A_frame
+
+    if N <= 0:
+        w_inner = 0.0
+    else:
+        w_inner = A_inner_target / (N * Ly)
+
+    # clamp to sane range (no negative thickness; no more than Lx)
+    w_inner = max(0.0, min(w_inner, Lx))
+
+    # ---- build vertices ----
+    bottom = [(0.0, 0.0)] + [(float(x), 0.0) for x in xs] + [(Lx, 0.0)]
+    top    = [(0.0, Ly)]  + [(float(x), Ly)  for x in xs] + [(Lx, Ly)]
     bottom.sort(key=lambda p: p[0])
     top.sort(key=lambda p: p[0])
 
@@ -40,36 +197,51 @@ def generate_vertical_struts(Lx, Ly, N=7, w=0.02, *, frame=True, w_frame=None):
             return
         edges.append((u, v))
         lengths.append(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
-        ths.append(wt)
+        ths.append(float(wt))
 
+    # inner vertical struts (thickness tuned)
     for x in xs:
-        add((x, 0.0), (x, Ly), w)
+        add((x, 0.0), (x, Ly), w_inner)
 
+    # frame edges (constant thickness W_frame)
     if frame:
-        for a, b in zip(bottom[:-1], bottom[1:]): add(a, b, w_frame)
-        for a, b in zip(top[:-1], top[1:]):       add(a, b, w_frame)
-        add((0.0, 0.0), (0.0, Ly), w_frame)
-        add((Lx, 0.0),  (Lx, Ly), w_frame)
+        for a, b in zip(bottom[:-1], bottom[1:]): add(a, b, W_frame)
+        for a, b in zip(top[:-1], top[1:]):       add(a, b, W_frame)
+        add((0.0, 0.0), (0.0, Ly), W_frame)
+        add((Lx, 0.0),  (Lx, Ly), W_frame)
 
+    # ---- graph ----
     G = ig.Graph(n=len(V), edges=edges)
     G.vs["x"], G.vs["y"] = vx, vy
     G.es["length"], G.es["thickness"] = lengths, ths
 
+    # ---- polygons ----
     polys = []
     for x in xs:
-        polys.append(_bar((x, 0.0), (x, Ly), w, dom))
+        polys.append(_bar((x, 0.0), (x, Ly), w_inner, dom))
+
     if frame:
         polys += [
-            _bar((0, 0), (Lx, 0), w_frame, dom),
-            _bar((0, Ly), (Lx, Ly), w_frame, dom),
-            _bar((0, 0), (0, Ly), w_frame, dom),
-            _bar((Lx, 0), (Lx, Ly), w_frame, dom),
+            _bar((0, 0), (Lx, 0), W_frame, dom),
+            _bar((0, Ly), (Lx, Ly), W_frame, dom),
+            _bar((0, 0), (0, Ly), W_frame, dom),
+            _bar((Lx, 0), (Lx, Ly), W_frame, dom),
         ]
 
     polys = [p for p in polys if not p.is_empty]
 
-    meta = dict(Lx=Lx, Ly=Ly, N=N, w=w, w_frame=w_frame,
-                graph_n=G.vcount(), graph_m=G.ecount())
+    # recompute achieved phi from the (approx) areas we used
+    A_inner = (N * w_inner * Ly) if N > 0 else 0.0
+    phi_achieved = (A_frame + A_inner) / A_dom if A_dom > 0 else 0.0
+
+    meta = dict(
+        Lx=Lx, Ly=Ly, N=N,
+        phi_target=float(phi_target),
+        phi_achieved=float(phi_achieved),
+        w_inner=float(w_inner),
+        W_frame=W_frame if frame else 0.0,
+        graph_n=G.vcount(), graph_m=G.ecount()
+    )
 
     return polys, meta, G
 
@@ -103,241 +275,392 @@ def edge_rectangles(start_points, end_points, width):
     ]
     return polygons
 
+def edge_rectangles_per_width(starts, ends, widths):
+    starts = np.asarray(starts, float)
+    ends   = np.asarray(ends, float)
+    widths = np.asarray(widths, float)
+
+    polys = []
+    for s, e, w in zip(starts, ends, widths):
+        if w <= 0:
+            polys.append(None)
+            continue
+        dx, dy = (e - s)
+        L = float(np.hypot(dx, dy))
+        if L <= 0:
+            polys.append(None)
+            continue
+
+        # unit normal
+        nx, ny = -dy / L, dx / L
+        hx, hy = 0.5 * w * nx, 0.5 * w * ny  # half-width
+
+        p0 = (s[0] + hx, s[1] + hy)
+        p1 = (e[0] + hx, e[1] + hy)
+        p2 = (e[0] - hx, e[1] - hy)
+        p3 = (s[0] - hx, s[1] - hy)
+
+        polys.append(Polygon([p0, p1, p2, p3]))
+
+    return polys
+
+def solve_inner_width_for_phi_frame_in_graph(
+    starts, ends, is_frame_edge, Lx, Ly, phi_target, *,
+    W_frame, tol=1e-4, max_iter=60, clip=True
+):
+    """
+    starts/ends: all segments (inner + frame)
+    is_frame_edge: (N,) bool array, True for frame segments
+    W_frame fixed; solve for W_inner so union area fraction matches phi_target.
+    """
+    is_frame_edge = np.asarray(is_frame_edge, dtype=bool)
+    if len(is_frame_edge) != len(starts):
+        raise ValueError("is_frame_edge must match number of segments")
+
+    if not (0.0 < phi_target < 1.0):
+        raise ValueError("phi_target must be in (0,1).")
+
+    def polys_for(W_inner):
+        widths = np.where(is_frame_edge, float(W_frame), float(W_inner))
+        polys_all = edge_rectangles_per_width(starts, ends, widths)
+        if clip:
+            dom = box(0.0, 0.0, Lx, Ly)
+            polys_all = [g.intersection(dom) if g is not None else None for g in polys_all]
+            polys_all = [g if (g is not None and (not g.is_empty) and g.area > 0) else None for g in polys_all]
+        polys = [g for g in polys_all if g is not None]
+        return polys, polys_all
+
+    # Lower bound: inner=0 (frame only, plus any rails you might have marked as non-frame)
+    polys0, polys0_all = polys_for(0.0)
+    phi0 = area_fraction(polys0, Lx, Ly)
+    if phi_target <= phi0 + tol:
+        return 0.0, float(phi0), polys0, polys0_all
+
+    W_lo = 0.0
+    W_hi = min(Lx, Ly) * 1e-3
+
+    for _ in range(100):
+        polys_hi, polys_hi_all = polys_for(W_hi)
+        phi_hi = area_fraction(polys_hi, Lx, Ly)
+        if phi_hi >= phi_target:
+            break
+        W_hi *= 2.0
+        if W_hi >= min(Lx, Ly) * 2.0:
+            break
+
+    polys_hi, polys_hi_all = polys_for(W_hi)
+    phi_hi = area_fraction(polys_hi, Lx, Ly)
+    if phi_hi < phi_target:
+        return float(W_hi), float(phi_hi), polys_hi, polys_hi_all
+
+    best_polys, best_phi, best_all = polys_hi, phi_hi, polys_hi_all
+    for _ in range(max_iter):
+        W_mid = 0.5 * (W_lo + W_hi)
+        polys_mid, polys_mid_all = polys_for(W_mid)
+        phi_mid = area_fraction(polys_mid, Lx, Ly)
+
+        best_polys, best_phi, best_all = polys_mid, phi_mid, polys_mid_all
+
+        if abs(phi_mid - phi_target) <= tol:
+            return float(W_mid), float(phi_mid), polys_mid, polys_mid_all
+
+        if phi_mid < phi_target:
+            W_lo = W_mid
+        else:
+            W_hi = W_mid
+
+    return float(0.5*(W_lo+W_hi)), float(best_phi), best_polys, best_all
+
+
+
+def snap_pts_to_grid(pts, p, Lx, Ly, eps=1e-10):
+    pts = np.asarray(pts, dtype=float).copy()
+
+    # snap to boundaries first
+    for col, L in [(0, Lx), (1, Ly)]:
+        v = pts[:, col]
+        v[np.isclose(v, 0.0, atol=eps)] = 0.0
+        v[np.isclose(v, L,   atol=eps)] = float(L)
+        pts[:, col] = v
+
+    # snap interior to pitch grid (avoid moving boundary points you just fixed)
+    # x
+    mask_x = ~np.isclose(pts[:,0], 0.0, atol=eps) & ~np.isclose(pts[:,0], Lx, atol=eps)
+    pts[mask_x, 0] = np.round(pts[mask_x, 0] / p) * p
+    # y
+    mask_y = ~np.isclose(pts[:,1], 0.0, atol=eps) & ~np.isclose(pts[:,1], Ly, atol=eps)
+    pts[mask_y, 1] = np.round(pts[mask_y, 1] / p) * p
+
+    return pts
+
 def lattice_params_polys_and_graph(
     Lx, Ly, p, phi_target, *,
+    W_frame=0.01,
     tol=1e-4, max_iter=60,
     clip=True,
-    stitch_every_row=True,   # if False, stitches only at y=0 and y=Ly
+    stitch_every_row=True,
 ):
+
     Lx = float(Lx); Ly = float(Ly); p = float(p); phi_target = float(phi_target)
+    W_frame = float(W_frame)
 
-    # --- enforce exact pitch vertically ---
-    m_y_float = Ly / p
-    m_y = int(round(m_y_float))
-    if abs(m_y_float - m_y) > 1e-9:
-        raise ValueError(f"Need Ly/p integer for exact pitch. Got Ly/p={m_y_float:g}")
-    Ny = m_y + 1
-    y = np.arange(Ny) * p  # 0..Ly exactly
+    # --- y grid must be exact ---
+    m_y = int(round(Ly / p))
+    if abs(Ly / p - m_y) > 1e-9:
+        raise ValueError(f"Need Ly/p integer. Got Ly/p={Ly/p:g}")
+    y = np.arange(m_y + 1, dtype=float) * p
+    y[-1] = Ly
 
-    # --- square lattice columns that fit in x ---
+    # --- x grid for inner lattice (may not reach Lx) ---
     nx = int(np.floor(Lx / p))
-    Nx = nx + 1
-    x = np.arange(Nx) * p              # 0..x_last
+    x = np.arange(nx + 1, dtype=float) * p
+    x[0] = 0.0
     x_last = float(x[-1])
 
-    # --- lattice segments ---
+    # --- inner lattice segments (square) ---
     xx, yy = np.meshgrid(x, y, indexing="ij")
-    h0 = np.c_[xx[:-1, :].ravel(), yy[:-1, :].ravel()]
-    h1 = np.c_[xx[1:,  :].ravel(), yy[1:,  :].ravel()]
-    v0 = np.c_[xx[:, :-1].ravel(), yy[:, :-1].ravel()]
-    v1 = np.c_[xx[:,  1:].ravel(), yy[:,  1:].ravel()]
-    starts = np.vstack([h0, v0])
-    ends   = np.vstack([h1, v1])
+    starts_inner = np.vstack([
+        np.c_[xx[:-1, :].ravel(), yy[:-1, :].ravel()],   # horizontal
+        np.c_[xx[:, :-1].ravel(), yy[:, :-1].ravel()],   # vertical
+    ])
+    ends_inner = np.vstack([
+        np.c_[xx[1:,  :].ravel(), yy[1:,  :].ravel()],
+        np.c_[xx[:,  1:].ravel(), yy[:,  1:].ravel()],
+    ])
 
-    # --- left & right rails (vertical, split by pitch) ---
-    left_starts  = np.c_[np.zeros(m_y), y[:-1]]
-    left_ends    = np.c_[np.zeros(m_y), y[1:]]
-    right_starts = np.c_[np.full(m_y, Lx), y[:-1]]
-    right_ends   = np.c_[np.full(m_y, Lx), y[1:]]
+    # --- stitches fill the true gap x_last->Lx if needed ---
+    if x_last < Lx - 1e-15:
+        ys = y if stitch_every_row else np.array([0.0, Ly], float)
+        starts_inner = np.vstack([starts_inner, np.c_[np.full(len(ys), x_last), ys]])
+        ends_inner   = np.vstack([ends_inner,   np.c_[np.full(len(ys), Lx),     ys]])
 
-    # --- stitches to prevent "floating" right rail ---
-    if stitch_every_row:
-        ys = y
-    else:
-        ys = np.array([0.0, Ly], dtype=float)
+    # --- frame segments on x-grid plus boundary Lx ---
+    x_frame = x if abs(x_last - Lx) < 1e-15 else np.r_[x, Lx]
+    fs, fe = boundary_frame_segments(x_frame, y, Lx, Ly)
 
-    # connect last lattice column (x_last) to boundary (Lx) at chosen y's
-    stitch_starts = np.c_[np.full(len(ys), x_last), ys]
-    stitch_ends   = np.c_[np.full(len(ys), Lx),     ys]
+    # --- all segments + frame mask ---
+    starts = np.vstack([starts_inner, fs])
+    ends   = np.vstack([ends_inner,   fe])
+    is_frame = np.zeros(len(starts), dtype=bool)
+    is_frame[len(starts_inner):] = True
 
-    # (optional) if you ever center the lattice, add left stitches too; here x starts at 0 so not needed.
-
-    starts = np.vstack([starts, left_starts, right_starts, stitch_starts])
-    ends   = np.vstack([ends,   left_ends,   right_ends,   stitch_ends])
-
-    # --- solve thickness INCLUDING rails + stitches (they affect area) ---
-    W_star, phi_star, _ = solve_width_for_phi(
-        starts, ends,
-        Lx=Lx, Ly=Ly,
-        phi_target=float(phi_target),
-        tol=float(tol),
-        max_iter=int(max_iter),
-        clip=bool(clip),
-        add_frame=False,
-        frame_factor=1.0,
+    # --- solve W_inner with fixed frame ---
+    W_inner, phi_star, _, _ = solve_inner_width_for_phi_frame_in_graph(
+        starts, ends, is_frame, Lx, Ly, phi_target,
+        W_frame=W_frame, tol=tol, max_iter=max_iter, clip=clip
     )
-    W_star = float(W_star)
-    phi_star = float(phi_star)
 
-    # --- polygons ---
-    polys_all = edge_rectangles(starts, ends, W_star)
+    widths = np.where(is_frame, W_frame, W_inner).astype(float)
+
+    # --- polygons (aligned to segments) ---
+    polys_all = edge_rectangles_per_width(starts, ends, widths)
     if clip:
         dom = box(0.0, 0.0, Lx, Ly)
-        polys_all = [g.intersection(dom) for g in polys_all]
-        polys_all = [g if (not g.is_empty and g.area > 0) else None for g in polys_all]
-    else:
-        polys_all = [g if (not g.is_empty and g.area > 0) else None for g in polys_all]
+        polys_all = [g.intersection(dom) if g is not None else None for g in polys_all]
+    polys_all = [g if (g is not None and (not g.is_empty) and g.area > 0) else None for g in polys_all]
     polys = [g for g in polys_all if g is not None]
 
-    # --- graph from segment endpoints (dedup by rounding) ---
-    pts = np.vstack([starts, ends])
-    scale = 1.0 / 1e-12
-    keys = np.round(pts * scale).astype(np.int64)
-
-    mp = {}
-    vx, vy = [], []
-    def vid(k, pxy):
-        kt = (int(k[0]), int(k[1]))
-        j = mp.get(kt)
-        if j is None:
-            j = len(vx)
-            mp[kt] = j
-            vx.append(float(pxy[0]))
-            vy.append(float(pxy[1]))
-        return j
-
-    edges = []
-    lengths = []
-    nseg = len(starts)
-    for s, e, ks, ke in zip(starts, ends, keys[:nseg], keys[nseg:]):
-        u = vid(ks, s)
-        v = vid(ke, e)
+    # --- graph (grid-keyed, robust) ---
+    vid, vx, vy = make_vid_from_grid(p, Lx, Ly)
+    edges, lengths, thk, teff = [], [], [], []
+    for s, e, w, poly in zip(starts, ends, widths, polys_all):
+        u, v = vid(s), vid(e)
         if u == v:
             continue
+        L = float(np.hypot(e[0]-s[0], e[1]-s[1]))
+        if L <= 0:
+            continue
         edges.append((u, v))
-        lengths.append(float(np.hypot(e[0]-s[0], e[1]-s[1])))
+        lengths.append(L)
+        thk.append(float(w))
+        teff.append(float(w) if poly is None else float(poly.area / L))
 
     G = ig.Graph(n=len(vx), edges=edges, directed=False)
-    G.vs["x"] = vx
-    G.vs["y"] = vy
+    G.vs["x"], G.vs["y"] = vx, vy
     G.es["length"] = lengths
-    G.es["thickness"] = [W_star] * len(edges)
-
-    # thickness_eff (aligned to segments; skip degenerates consistently)
-    seg_len = np.hypot(ends[:, 0] - starts[:, 0], ends[:, 1] - starts[:, 1])
-    seg_teff = [
-        float(W_star) if (poly is None or L <= 0) else float(poly.area / float(L))
-        for poly, L in zip(polys_all, seg_len)
-    ]
-    teff_kept = [te for L, te in zip(seg_len, seg_teff) if L > 0]
-    G.es["thickness_eff"] = teff_kept
+    G.es["thickness"] = thk
+    G.es["thickness_eff"] = teff
 
     meta = dict(
-        p=float(p), m_y=int(m_y),
-        nx=int(nx), x_last=float(x_last),
-        Lx=float(Lx), Ly=float(Ly),
-        W=float(W_star),
-        phi_target=float(phi_target),
-        phi_achieved=float(phi_star),
+        p=p, m_y=m_y, nx=nx, x_last=x_last,
+        Lx=Lx, Ly=Ly,
+        W_inner=float(W_inner), W_frame=float(W_frame),
+        phi_target=phi_target, phi_achieved=float(phi_star),
         n_segments=int(len(starts)),
         stitch_every_row=bool(stitch_every_row),
         clip=bool(clip),
     )
     return polys, meta, G
 
-def lattice_params_polys_and_graph_old(Lx, Ly, p, phi_target, *, center=True, clip=True):
+def boundary_frame_segments(x, y, Lx, Ly, inset):
     """
-    Finite-size explicit model (valid up to saturation W>=p):
-    - Chooses Nx,Ny to fit inside Lx,Ly with square pitch p (allows leftover margins)
-    - Computes W from phi_target using the finite-size strip-union model
-    - Output polygons (bars) using your edge_rectangles so you can plot
-
-    Returns:
-      polys : list[shapely.geometry.Polygon]
-      meta  : dict with Nx, Ny, p, W, phi_max, offsets, achieved_phi_model
-        G:
-      - vertex attrs: x, y
-      - edge attrs: length, thickness (nominal bulk = W), thickness_eff (from polygon, may differ near boundary)
+    Frame segments inset from the domain boundary by `inset` (typically W_frame/2),
+    so the rectangles lie fully inside and clipping doesn't halve thickness.
     """
+    x = np.asarray(x, float).copy()
+    y = np.asarray(y, float).copy()
+    inset = float(inset)
 
-    # ---- choose Nx,Ny + offsets ----
-    Nx = int(np.floor(Lx / p)) + 1
-    Ny = int(np.floor(Ly / p)) + 1
-    if Nx < 2 or Ny < 2:
-        raise ValueError("Pitch too large: need Nx,Ny >= 2.")
+    # clamp inset
+    inset = max(0.0, min(inset, 0.49*min(Lx, Ly)))
 
-    Lx_lat = (Nx - 1) * p
-    Ly_lat = (Ny - 1) * p
-    ox = 0.5 * (Lx - Lx_lat) if center else 0.0
-    oy = 0.5 * (Ly - Ly_lat) if center else 0.0
+    x0, x1 = inset, Lx - inset
+    y0, y1 = inset, Ly - inset
 
-    # ---- invert finite-size phi(W) mapping ----
-    phi_max = (Lx_lat * Ly_lat) / (Lx * Ly)
-    if phi_target >= phi_max:
-        W = float(p)
-    else:
-        Astar = phi_target * (Lx * Ly)
-        B = (Nx - 1) * Ly_lat + (Ny - 1) * Lx_lat
-        C = (Nx - 1) * (Ny - 1)
-        disc = B * B - 4.0 * C * Astar
-        if disc < 0:
-            raise ValueError("Target phi unattainable for this (p,Nx,Ny) in W<p regime.")
-        W = float((B - np.sqrt(disc)) / (2.0 * C))
+    # For bottom/top, use x grid but clipped to [x0,x1] endpoints
+    xb = x.copy()
+    xb[0] = x0
+    xb[-1] = x1
 
-    # achieved phi (same model)
-    if W < p:
-        lx, ly = (Nx - 1) * W, (Ny - 1) * W
-    else:
-        lx, ly = Lx_lat, Ly_lat
-    phi_model = (lx * Ly_lat + ly * Lx_lat - lx * ly) / (Lx * Ly)
+    yb = y.copy()
+    yb[0] = y0
+    yb[-1] = y1
 
-    # ---- node coords ----
-    x = ox + np.arange(Nx) * p
-    y = oy + np.arange(Ny) * p
+    nx = len(xb) - 1
+    ny = len(yb) - 1
+    zeros_x = np.zeros(nx)
+    zeros_y = np.zeros(ny)
+
+    # bottom/top at y0/y1
+    b0 = np.c_[xb[:-1], zeros_x + y0]; b1 = np.c_[xb[1:], zeros_x + y0]
+    t0 = np.c_[xb[:-1], zeros_x + y1]; t1 = np.c_[xb[1:], zeros_x + y1]
+
+    # left/right at x0/x1
+    l0 = np.c_[zeros_y + x0, yb[:-1]]; l1 = np.c_[zeros_y + x0, yb[1:]]
+    r0 = np.c_[zeros_y + x1, yb[:-1]]; r1 = np.c_[zeros_y + x1, yb[1:]]
+
+    return np.vstack([b0, t0, l0, r0]), np.vstack([b1, t1, l1, r1])
+
+
+def make_vid_from_grid(p, Lx, Ly, eps=1e-12):
+    """Return a vertex-id function that keys points by (grid index, boundary flags)."""
+    mp, vx, vy = {}, [], []
+
+    def xk(x):
+        if abs(x-0.0) < eps: return ("B", 0)
+        if abs(x-Lx)  < eps: return ("B", 1)
+        return ("I", int(round(x/p)))
+
+    def yk(y):
+        if abs(y-0.0) < eps: return ("B", 0)
+        if abs(y-Ly)  < eps: return ("B", 1)
+        return ("I", int(round(y/p)))
+
+    def vid(pt):
+        k = (xk(float(pt[0])), yk(float(pt[1])))
+        j = mp.get(k)
+        if j is None:
+            j = len(vx); mp[k] = j
+            vx.append(float(pt[0])); vy.append(float(pt[1]))
+        return j
+
+    return vid, vx, vy
+
+def lattice_params_polys_and_graph(
+    Lx, Ly, p, phi_target, *,
+    W_frame=0.01,
+    tol=1e-4, max_iter=60,
+    clip=True,
+    stitch_every_row=True,
+):
+
+    Lx = float(Lx); Ly = float(Ly); p = float(p); phi_target = float(phi_target)
+    W_frame = float(W_frame)
+
+    # --- y grid must be exact ---
+    m_y = int(round(Ly / p))
+    if abs(Ly / p - m_y) > 1e-9:
+        raise ValueError(f"Need Ly/p integer. Got Ly/p={Ly/p:g}")
+    y = np.arange(m_y + 1, dtype=float) * p
+    y[-1] = Ly
+
+    # --- x grid for inner lattice (may not reach Lx) ---
+    nx = int(np.floor(Lx / p))
+    x = np.arange(nx + 1, dtype=float) * p
+    x[0] = 0.0
+    x_last = float(x[-1])
+
+    # --- inner lattice segments (square) ---
     xx, yy = np.meshgrid(x, y, indexing="ij")
-    X = xx.ravel()
-    Y = yy.ravel()
-    N = Nx * Ny
+    starts_inner = np.vstack([
+        np.c_[xx[:-1, :].ravel(), yy[:-1, :].ravel()],   # horizontal
+        np.c_[xx[:, :-1].ravel(), yy[:, :-1].ravel()],   # vertical
+    ])
+    ends_inner = np.vstack([
+        np.c_[xx[1:,  :].ravel(), yy[1:,  :].ravel()],
+        np.c_[xx[:,  1:].ravel(), yy[:,  1:].ravel()],
+    ])
 
-    # ---- edges (same ordering as polygon generation) ----
-    # node id: id(i,j)=i*Ny+j
-    eh = [(i*Ny + j, (i+1)*Ny + j) for i in range(Nx-1) for j in range(Ny)]
-    ev = [(i*Ny + j, i*Ny + (j+1)) for i in range(Nx) for j in range(Ny-1)]
-    edges = eh + ev
+    # --- stitches fill the true gap x_last->Lx if needed ---
+    if x_last < Lx - 1e-15:
+        ys = y if stitch_every_row else np.array([0.0, Ly], float)
+        starts_inner = np.vstack([starts_inner, np.c_[np.full(len(ys), x_last), ys]])
+        ends_inner   = np.vstack([ends_inner,   np.c_[np.full(len(ys), Lx),     ys]])
 
-    # ---- graph ----
-    G = ig.Graph(n=N, edges=edges, directed=False)
-    G.vs["x"] = X.tolist()
-    G.vs["y"] = Y.tolist()
+    # --- frame segments on x-grid plus boundary Lx ---
+    x_frame = x if abs(x_last - Lx) < 1e-15 else np.r_[x, Lx]
+    fs, fe = boundary_frame_segments(x_frame, y, Lx, Ly, W_frame/2)
 
-    # lengths (robust even if p changes later)
-    lengths = []
-    for u, v in edges:
-        lengths.append(float(np.hypot(X[v] - X[u], Y[v] - Y[u])))
-    G.es["length"] = lengths
-    G.es["thickness"] = [float(W)] * len(edges)  # bulk/nominal for all edges
+    # --- all segments + frame mask ---
+    starts = np.vstack([starts_inner, fs])
+    ends   = np.vstack([ends_inner,   fe])
+    is_frame = np.zeros(len(starts), dtype=bool)
+    is_frame[len(starts_inner):] = True
 
-    # ---- polygons in the same order as edges ----
-    # (horizontal then vertical)
-    h0 = np.c_[xx[:-1, :].ravel(), yy[:-1, :].ravel()]
-    h1 = np.c_[xx[1:,  :].ravel(), yy[1:,  :].ravel()]
-    v0 = np.c_[xx[:, :-1].ravel(), yy[:, :-1].ravel()]
-    v1 = np.c_[xx[:,  1:].ravel(), yy[:,  1:].ravel()]
-    polys_all = edge_rectangles(h0, h1, W) + edge_rectangles(v0, v1, W)
+    # --- solve W_inner with fixed frame ---
+    W_inner, phi_star, _, _ = solve_inner_width_for_phi_frame_in_graph(
+        starts, ends, is_frame, Lx, Ly, phi_target,
+        W_frame=W_frame, tol=tol, max_iter=max_iter, clip=clip
+    )
 
-    # clip polygons (optional), but keep alignment to compute thickness_eff
+    widths = np.where(is_frame, W_frame, W_inner).astype(float)
+
+    # --- polygons (aligned to segments) ---
+    polys_all = edge_rectangles_per_width(starts, ends, widths)
     if clip:
         dom = box(0.0, 0.0, Lx, Ly)
-        polys_all = [g.intersection(dom) for g in polys_all]
-        polys_all = [g if (not g.is_empty and g.area > 0) else None for g in polys_all]
-
-    # effective thickness from polygon: area / centerline length
-    thickness_eff = []
-    for poly, L in zip(polys_all, lengths):
-        thickness_eff.append(float(W) if (poly is None or L <= 0) else float(poly.area / L))
-    G.es["thickness_eff"] = thickness_eff
-
-    # final polys list (drop empties for downstream plotting if you want)
+        polys_all = [g.intersection(dom) if g is not None else None for g in polys_all]
+    polys_all = [g if (g is not None and (not g.is_empty) and g.area > 0) else None for g in polys_all]
     polys = [g for g in polys_all if g is not None]
 
+    # frame polygons only
+    frame_polys = [g for g, fr in zip(polys_all, is_frame) if fr and g is not None]
+    inner_polys = [g for g, fr in zip(polys_all, is_frame) if (not fr) and g is not None]
+
+    print("frame area fraction:", sum(g.area for g in frame_polys) / (Lx*Ly))
+    print("inner area fraction:", sum(g.area for g in inner_polys) / (Lx*Ly))
+
+    # --- graph (grid-keyed, robust) ---
+    vid, vx, vy = make_vid_from_grid(p, Lx, Ly)
+    edges, lengths, thk, teff = [], [], [], []
+    for s, e, w, poly in zip(starts, ends, widths, polys_all):
+        u, v = vid(s), vid(e)
+        if u == v:
+            continue
+        L = float(np.hypot(e[0]-s[0], e[1]-s[1]))
+        if L <= 0:
+            continue
+        edges.append((u, v))
+        lengths.append(L)
+        thk.append(float(w))
+        teff.append(float(w) if poly is None else float(poly.area / L))
+
+    G = ig.Graph(n=len(vx), edges=edges, directed=False)
+    G.vs["x"], G.vs["y"] = vx, vy
+    G.es["length"] = lengths
+    G.es["thickness"] = thk
+    G.es["thickness_eff"] = teff
+
     meta = dict(
-        Nx=Nx, Ny=Ny, p=float(p), W=float(W),
-        phi_target=float(phi_target), phi_model=float(phi_model), phi_max=float(phi_max),
-        Lx_lat=float(Lx_lat), Ly_lat=float(Ly_lat), ox=float(ox), oy=float(oy),
-        n_vertices=int(N), n_edges=int(len(edges)), clip=bool(clip),
+        p=p, m_y=m_y, nx=nx, x_last=x_last,
+        Lx=Lx, Ly=Ly,
+        W_inner=float(W_inner), W_frame=float(W_frame),
+        phi_target=phi_target, phi_achieved=float(phi_star),
+        n_segments=int(len(starts)),
+        stitch_every_row=bool(stitch_every_row),
+        clip=bool(clip),
     )
     return polys, meta, G
-
 
 def initialize_points_rect(n_points=400, Lx=16.0, Ly=1.0, seed=None):
     rng = np.random.default_rng(seed)
@@ -500,9 +823,9 @@ def solve_width_for_phi(
     W = 0.5 * (W_lo + W_hi)
     return float(W), float(best_phi), best_polys
 
-def _clip_segments_to_box(starts, ends, Lx, Ly):
-    """Clip line segments to [0,Lx]x[0,Ly]. Returns arrays (S,E) of clipped segments."""
-    dom = box(0.0, 0.0, float(Lx), float(Ly))
+def _clip_segments_to_box(starts, ends, xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0):
+    """Clip line segments to [xmin,xmax]x[ymin,ymax]. Returns arrays (S,E) of clipped segments."""
+    dom = box(float(xmin), float(ymin), float(xmax), float(ymax))
     S_out, E_out = [], []
 
     for a, b in zip(starts, ends):
@@ -511,7 +834,6 @@ def _clip_segments_to_box(starts, ends, Lx, Ly):
         if inter.is_empty:
             continue
 
-        # intersection can be LineString or MultiLineString (rare but possible)
         if inter.geom_type == "LineString":
             coords = list(inter.coords)
             if len(coords) >= 2:
@@ -698,8 +1020,134 @@ def merge_tol_from_segments(starts, ends, Lx, Ly):
     L1 = float(np.percentile(L, 1.0))
     return max(1e-8 * diag, 1e-3 * L1)
 
+def inner_network_poly(S_in, E_in, W_inner, clip_geom):
+    # 1) build all centerlines
+    lines = [LineString([tuple(a), tuple(b)]) for a, b in zip(S_in, E_in)]
+    merged = unary_union(lines)  # merges collinear/touching lines into a proper network
+
+    # 2) buffer ONCE (junctions handled cleanly)
+    poly = merged.buffer(
+        W_inner/2,
+        cap_style=3,   # square ends (good for welding)
+        join_style=3,  # bevel joins (prevents spikes)
+    )
+
+    # 3) clip to allowed region
+    return poly.intersection(clip_geom)
 
 def generate_random_voronoi_network(
+    Lx=16.0, Ly=1.0, n_points=400, phi_target=0.05,
+    seed=None, tol=1e-3, max_iter=30, clip=True,
+    add_frame=True, frame_factor=1.0
+):
+    """
+    Old Voronoi network style (no inner clipping, same _bar usage),
+    but with a proper in-domain frame ring that corners correctly
+    and connects naturally (by overlap) with the Voronoi bars.
+
+    Frame thickness = Wf = frame_factor * W (same coupling as before),
+    and W is solved so that total union area fraction matches phi_target.
+    """
+    Lx, Ly = float(Lx), float(Ly)
+    phi_target = float(phi_target)
+    frame_factor = float(frame_factor)
+
+    outer = box(0.0, 0.0, Lx, Ly)
+    A_dom = Lx * Ly
+
+    points = initialize_points_rect(n_points=n_points, Lx=Lx, Ly=Ly, seed=seed)
+    starts, ends, vor = voronoi_ridge_segments_clipped(points, Lx, Ly)
+
+    # Clip centerlines to the outer domain (safe, keeps old behavior)
+    if clip:
+        S, E = _clip_segments_to_box(starts, ends, 0.0, 0.0, Lx, Ly)
+    else:
+        S = np.asarray(starts, float)
+        E = np.asarray(ends, float)
+
+    def build_polys(W):
+        W = float(W)
+        polys = []
+
+        # Voronoi struts (same bar behavior as before)
+        for a, b in zip(S, E):
+            p = _bar(tuple(a), tuple(b), W, outer)
+            if p is not None and not p.is_empty:
+                polys.append(p)
+
+        # Frame as an exact ring: outer \ inner (perfect corners, fully inside domain)
+        if add_frame:
+            Wf = frame_factor * W
+            if Wf > 0:
+                inner = box(Wf, Wf, Lx - Wf, Ly - Wf)
+                # if inner collapses, frame is just the whole outer
+                frame_poly = outer if (Lx - 2*Wf <= 0 or Ly - 2*Wf <= 0) else outer.difference(inner)
+                polys.append(frame_poly)
+
+        return polys
+
+    def phi_of_W(W):
+        polys = build_polys(W)
+        if not polys:
+            return 0.0, polys
+        u = unary_union(polys)
+        return float(u.area) / A_dom, polys
+
+    # --- solve W by bisection (exact union area) ---
+    lo = 0.0
+    phi_lo, polys_lo = phi_of_W(lo)
+
+    # If target is 0 or negative, trivial
+    if phi_target <= phi_lo + tol:
+        W = lo
+        phi_ach, polys = phi_lo, polys_lo
+    else:
+        # Find an upper bound
+        hi = 0.01 * min(Lx, Ly)
+        hi = max(hi, 1e-6)
+        phi_hi, polys_hi = phi_of_W(hi)
+
+        # Expand until we exceed target or hit a hard cap
+        hard_cap = 0.49 * min(Lx, Ly)  # frame would degenerate near 0.5*min dimension
+        while phi_hi < phi_target and hi < hard_cap:
+            hi *= 2.0
+            phi_hi, polys_hi = phi_of_W(hi)
+
+        if phi_hi < phi_target:
+            # Unreachable within cap: return best effort
+            W = hi
+            phi_ach, polys = phi_hi, polys_hi
+        else:
+            W = None
+            polys = None
+            phi_ach = None
+            for _ in range(int(max_iter)):
+                mid = 0.5 * (lo + hi)
+                phi_mid, polys_mid = phi_of_W(mid)
+
+                W, phi_ach, polys = mid, phi_mid, polys_mid
+                if abs(phi_mid - phi_target) <= tol:
+                    break
+                if phi_mid < phi_target:
+                    lo = mid
+                else:
+                    hi = mid
+
+    meta = {
+        "Lx": float(Lx), "Ly": float(Ly),
+        "n_points": int(n_points),
+        "n_segments": int(S.shape[0]),
+        "W": float(W),
+        "phi_target": float(phi_target),
+        "phi_achieved": float(phi_ach),
+        "seed": seed,
+        "add_frame": bool(add_frame),
+        "frame_factor": float(frame_factor),
+        "W_frame": float(frame_factor * W) if add_frame else 0.0,
+        "frame_mode": "ring_outer_minus_inner",
+    }
+    return polys, meta, points, vor
+def generate_random_voronoi_network_old(
     Lx=16.0, Ly=1.0, n_points=400, phi_target=0.05,
     seed=None, tol=1e-3, max_iter=30, clip=True,
     add_frame=True, frame_factor=1.0
