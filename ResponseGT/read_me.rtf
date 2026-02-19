@@ -1,0 +1,32 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww16660\viewh18140\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 This script is designed to do two types of calculations:\
+\
+	1: the response of a clamped 2D sheet in 3D space to an applied displacement at one end\
+\
+	2: the resonant modes of a clamped 2D sheet in 3D space\
+\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 This script is split into four sections: 1, imports; 2: methods; 3: execution; 4: plotting. \
+You should only have to change anything in section 3, or 4 if you want to change the plot.\
+\
+In section 3, you first have to specify which of the above calculations you wish to perform by setting the \'93response_to_load_boolean\'94 to True/False for calculation 1/2 respectively. If you are doing eigenmode analysis and wish to plot the result, you must also specify the plotted mode via plotted_mode_index.\
+\
+Next, you must import the network vertices/edges. I included the aperiodic network you sent me before as an example of the required format (vertices as paris of x,y positions, edges as pairs of vertex indices). For this particular network data, there were two non-local edges in the original file that I manually remove in the example calculation. You should delete this removal of edges for other networks.\
+\
+Next, you convert the 2D network data into a 3D network using the \'93expand_network_to_3d(verts, edges)\'94 function. You can optionally include a width of the generated network as a third parameter.\
+\
+Next, we create a list of spring stiffnesses for each of the 3D edges. By default, this function gives all edges a stiffness of 1. If you wish to make edges have different stiffnesses, you can pass in an optional \'93k_2d_list\'94 parameter. Some edges in the 3D network are between two 3D vertices that correspond to the same 2D vertex. You can change their stiffnesses through the optional parameter \'93k_intra.\'94\
+\
+Next, we construct a pinned compatibility matrix. By default, this will pin 5% of vertices with the smallest x-coordinate. You can change which vertices are pinned and how many are pinned by passing in optional parameters: Cartesian_direction (0 for x, 1 for y, 2 for z), smallest_boolean (True for smallest position in the provided Cartesian_direction, frac_selected (fraction of vertices pinned) to the \'93pinnedCmat\'94 function.\
+\
+For calculations of type 1, you must specify what load is being applied the system with the \'93get_imposed_displacements\'94 function. This function will allow you to apply a displacement vector (default: \{0,0,10\}) to a selected fraction of vertices with the smallest/largest coordinate in a cartesian direction. These variables operate the same as the pinnedCmat function. \
+\
+Calculations of type 1 will then output the resulting displacement of each vertex (all_displacements), the resulting tension on each edge (all_tensions), and the needed force to generate the given applied displacement (total_applied_force). Note that the applied force will be extremely low for applied displacements that resemble low-frequency eigenmodes (as is the case for the default calculation)\
+\
+For calculations of type 2, you need not specify any additional information. The displacements and tensions of the resonant mode will be outputted, and the frequency will be printed.}
