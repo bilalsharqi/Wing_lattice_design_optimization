@@ -13,7 +13,7 @@ def generate_polys_for_pattern(pattern: str, Lx: float, Ly: float, phi: float):
             Lx, Ly, p=Ly / 3, phi_target=phi, clip=True
         ),
 
-        "original": lambda: generate_vertical_struts(Lx= Lx, Ly=Ly, N=7, w = 0.054),
+        "original": lambda: generate_vertical_struts(Lx= Lx, Ly=Ly, N=7, w = 20),
 
 
         "voronoi": lambda: generate_random_voronoi_network(
@@ -40,11 +40,12 @@ def generate_polys_for_pattern(pattern: str, Lx: float, Ly: float, phi: float):
     return polys, meta, G
 
 if __name__ == "__main__":
-    patterns = ["square","voronoi","graded_hexagonal"]
-    Lx = 4.3
-    Ly = 1.0
-    ribs_Lz = 0.16
-    shell_Lz = 0.008
+    # patterns = ["square","voronoi","graded_hexagonal"]
+    patterns = ["graded_hexagonal"]
+    Lx = 4300
+    Ly = 1000
+    ribs_Lz = 160
+    shell_Lz = 8
     phi = 0.15 #areal fraction coverage. used only to thicken lines (doesn't modifiy complexity)
     export_step_flag = True
 

@@ -346,8 +346,8 @@ def calculate_vibrational_modes(Cmat, k_list, k):
 #=================================================================================
 
 #Choosing which tool you want, response to a load, or eigenmode calculation
-response_to_load_boolean = False
-plotted_mode_index = 3
+response_to_load_boolean = True
+plotted_mode_index = 1
 
 #importing data
 nodes_df = pd.read_csv('nodes_AP.csv')
