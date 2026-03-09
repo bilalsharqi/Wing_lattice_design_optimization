@@ -17,12 +17,14 @@ from gt_metrics import (
     edge_betweenness_stats,
 )
 
-# Keep both generators available
 from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
-
-# Square-lattice-specific visualization
 from viz_square_lattice import visualize_square_lattice, visualize_damage_on_square_lattice
+from grouped_pruning import (
+    build_spanwise_bay_groups,
+    evaluate_group_scores,
+    prune_one_group,
+)
 
 
 def make_fixed_dofs_for_root_clamp(nodes, root_mask):
@@ -54,45 +56,11 @@ def simple_sizing_update(
     return np.clip(new_a, a_min, a_max)
 
 
-def prune_members(
-    edges,
-    areas,
-    stress,
-    force,
-    protect_root_nodes,
-    sigma_allow,
-    area_factor=1.10,
-    stress_frac=0.03,
-    force_frac=0.03,
-):
-    keep = np.ones(len(edges), dtype=bool)
-    max_abs_force = max(float(np.max(np.abs(force))), 1e-16)
-
-    low_area = areas <= area_factor * np.min(areas)
-    low_stress = np.abs(stress) <= stress_frac * sigma_allow
-    low_force = np.abs(force) <= force_frac * max_abs_force
-
-    removed_idx = []
-    for e, (i, j) in enumerate(edges):
-        if i in protect_root_nodes or j in protect_root_nodes:
-            continue
-        if low_area[e] and low_stress[e] and low_force[e]:
-            keep[e] = False
-            removed_idx.append(e)
-
-    if np.sum(keep) == 0:
-        keep[:] = True
-        removed_idx = []
-
-    return edges[keep], areas[keep], keep, np.array(removed_idx, dtype=int)
-
-
-def try_prune_and_validate(
+def try_grouped_prune_and_validate(
     wing,
     nodes,
     edges,
     areas,
-    root_nodes,
     sigma_allow,
     res,
     E_modulus,
@@ -101,106 +69,129 @@ def try_prune_and_validate(
     damage_k,
 ):
     """
-    Try a pruning step. Accept only if BOTH:
-      1) intact trial graph remains connected and solvable
-      2) damaged trial graph remains connected and solvable
+    Try removing exactly one pruning group.
+    Candidate groups are diagonal-member spanwise bins split by orientation.
+    Accept only if intact and damaged trial graphs remain solvable.
     """
-    trial_edges, trial_areas, keep_mask, removed_edges_idx = prune_members(
+    groups, labels = build_spanwise_bay_groups(nodes, edges, wing, n_span_bins=14)
+    print(f"  grouped pruning: {len(groups)} candidate groups")
+
+    if len(groups) == 0:
+        return nodes, edges, areas, np.zeros((0,), dtype=int), False, "no_groups_available"
+
+    scores = evaluate_group_scores(
         edges,
         areas,
-        res.member_stress,
         res.member_force,
-        root_nodes,
+        res.member_stress,
+        groups,
         sigma_allow,
-        area_factor=1.10,
-        stress_frac=0.03,
-        force_frac=0.03,
     )
+    order = np.argsort(scores)
 
-    # Filter to intact root-connected component
-    trial_nodes, trial_edges, trial_areas, keep_nodes_intact, edge_keep_mask_intact = filter_to_root_connected_intact(
-        nodes,
-        trial_edges,
-        trial_areas,
-        wing,
-    )
+    for idx in order:
+        gidx = groups[idx]
+        glabel = labels[idx]
 
-    if not is_connected_safe(len(trial_nodes), trial_edges):
-        return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_intact_disconnected"
+        trial_edges, trial_areas, removed_edges_idx = prune_one_group(edges, areas, gidx)
 
-    trial_root_mask = wing.root_mask(trial_nodes)
-    trial_fixed_dofs = make_fixed_dofs_for_root_clamp(trial_nodes, trial_root_mask)
-
-    try:
-        f_trial = distributed_vertical_load_to_nodes(
-            trial_nodes, wing.span, total_lift, distribution="elliptic"
-        )
-        trial_tip_node_idx = choose_tip_node(trial_nodes, wing)
-        trial_res = solve_truss(
-            trial_nodes,
+        trial_nodes, trial_edges, trial_areas, keep_nodes_intact, edge_keep_mask_intact = filter_to_root_connected_intact(
+            nodes,
             trial_edges,
             trial_areas,
-            E_modulus,
-            f_trial,
-            trial_fixed_dofs,
             wing,
-            regularization=0.0,
-            tip_node_idx=trial_tip_node_idx,
         )
 
-        if (not np.isfinite(trial_res.cond_est)) or (trial_res.cond_est > cond_max):
-            return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_intact_mechanism"
+        if not is_connected_safe(len(trial_nodes), trial_edges):
+            print(f"    reject {glabel}: intact disconnected")
+            continue
 
-    except Exception:
-        return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_intact_singular"
+        trial_root_mask = wing.root_mask(trial_nodes)
+        trial_fixed_dofs = make_fixed_dofs_for_root_clamp(trial_nodes, trial_root_mask)
 
-    # Damaged trial check
-    target = np.array([0.5 * wing.chord, 0.6 * wing.span, 0.0])
-    seed = int(np.argmin(np.linalg.norm(trial_nodes - target.reshape(1, 3), axis=1)))
+        try:
+            f_trial = distributed_vertical_load_to_nodes(
+                trial_nodes,
+                wing.span,
+                total_lift,
+                distribution="elliptic",
+            )
+            trial_tip = choose_tip_node(trial_nodes, wing)
+            trial_res = solve_truss(
+                trial_nodes,
+                trial_edges,
+                trial_areas,
+                E_modulus,
+                f_trial,
+                trial_fixed_dofs,
+                wing,
+                regularization=0.0,
+                tip_node_idx=trial_tip,
+            )
 
-    damage_info = damage_and_check_full_connectivity(
-        wing=wing,
-        nodes=trial_nodes,
-        edges=trial_edges,
-        areas=trial_areas,
-        seed=seed,
-        k=damage_k,
-    )
+            if (not np.isfinite(trial_res.cond_est)) or (trial_res.cond_est > cond_max):
+                print(f"    reject {glabel}: intact mechanism/ill-conditioned (cond={trial_res.cond_est:.3e})")
+                continue
 
-    if (not damage_info["connected"]) or (not damage_info.get("graph_screen_passed", False)):
-        return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_damaged_screen"
+        except Exception as err:
+            print(f"    reject {glabel}: intact singular ({err})")
+            continue
 
-    trial_nodes_d = damage_info["nodes_d"]
-    trial_edges_d = damage_info["edges_d"]
-    trial_areas_d = damage_info["areas_d"]
+        target = np.array([0.5 * wing.chord, 0.6 * wing.span, 0.0])
+        seed = int(np.argmin(np.linalg.norm(trial_nodes - target.reshape(1, 3), axis=1)))
 
-    trial_root_mask_d = wing.root_mask(trial_nodes_d)
-    trial_fixed_dofs_d = make_fixed_dofs_for_root_clamp(trial_nodes_d, trial_root_mask_d)
-
-    try:
-        f_trial_d = distributed_vertical_load_to_nodes(
-            trial_nodes_d, wing.span, total_lift, distribution="elliptic"
+        damage_info = damage_and_check_full_connectivity(
+            wing=wing,
+            nodes=trial_nodes,
+            edges=trial_edges,
+            areas=trial_areas,
+            seed=seed,
+            k=damage_k,
         )
-        trial_tip_node_idx_d = choose_tip_node(trial_nodes_d, wing)
-        trial_res_d = solve_truss(
-            trial_nodes_d,
-            trial_edges_d,
-            trial_areas_d,
-            E_modulus,
-            f_trial_d,
-            trial_fixed_dofs_d,
-            wing,
-            regularization=0.0,
-            tip_node_idx=trial_tip_node_idx_d,
-        )
 
-        if (not np.isfinite(trial_res_d.cond_est)) or (trial_res_d.cond_est > cond_max):
-            return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_damaged_mechanism"
+        if (not damage_info["connected"]) or (not damage_info.get("graph_screen_passed", False)):
+            print(f"    reject {glabel}: damaged screen failed")
+            continue
 
-    except Exception:
-        return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_damaged_singular"
+        trial_nodes_d = damage_info["nodes_d"]
+        trial_edges_d = damage_info["edges_d"]
+        trial_areas_d = damage_info["areas_d"]
 
-    return trial_nodes, trial_edges, trial_areas, removed_edges_idx, True, "prune_accepted"
+        trial_root_mask_d = wing.root_mask(trial_nodes_d)
+        trial_fixed_dofs_d = make_fixed_dofs_for_root_clamp(trial_nodes_d, trial_root_mask_d)
+
+        try:
+            f_trial_d = distributed_vertical_load_to_nodes(
+                trial_nodes_d,
+                wing.span,
+                total_lift,
+                distribution="elliptic",
+            )
+            trial_tip_d = choose_tip_node(trial_nodes_d, wing)
+            trial_res_d = solve_truss(
+                trial_nodes_d,
+                trial_edges_d,
+                trial_areas_d,
+                E_modulus,
+                f_trial_d,
+                trial_fixed_dofs_d,
+                wing,
+                regularization=0.0,
+                tip_node_idx=trial_tip_d,
+            )
+
+            if (not np.isfinite(trial_res_d.cond_est)) or (trial_res_d.cond_est > cond_max):
+                print(f"    reject {glabel}: damaged mechanism/ill-conditioned (cond={trial_res_d.cond_est:.3e})")
+                continue
+
+        except Exception as err:
+            print(f"    reject {glabel}: damaged singular ({err})")
+            continue
+
+        print(f"    accept {glabel}: removed {len(removed_edges_idx)} edges")
+        return trial_nodes, trial_edges, trial_areas, removed_edges_idx, True, f"prune_accepted_{glabel}"
+
+    return nodes, edges, areas, np.zeros((0,), dtype=int), False, "prune_rejected_all_groups"
 
 
 def save_iteration_hdf5(h5, it, data_dict):
@@ -221,25 +212,7 @@ def save_iteration_hdf5(h5, it, data_dict):
             grp.attrs[key] = json.dumps(val)
 
 
-def plot_lattice(ax, nodes, edges, title, stride=1, color="C0", alpha=0.8):
-    ax.set_title(title)
-    if len(edges) == 0:
-        return
-    use = np.arange(0, len(edges), max(1, stride))
-    for e in use:
-        i, j = edges[e]
-        p = nodes[i]
-        q = nodes[j]
-        ax.plot([p[0], q[0]], [p[1], q[1]], [p[2], q[2]], color=color, linewidth=0.8, alpha=alpha)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-
-
 def build_lattice(wing, lattice_type):
-    """
-    Switch between lattice families here.
-    """
     if lattice_type == "square":
         lat = generate_square_wingbox_lattice(
             span=wing.span,
@@ -270,9 +243,6 @@ def build_lattice(wing, lattice_type):
 def main():
     wing = WingBox(span=4.0, chord=1.0, depth=0.16, root_tol=1e-9)
 
-    # -----------------------------
-    # USER CHOICE: switch graph here
-    # -----------------------------
     lattice_type = "square"
     # lattice_type = "octet"
 
@@ -280,7 +250,7 @@ def main():
     density = 2700.0
     sigma_allow = 250e6
     u_tip_max = 0.25
-    cond_max = 1e10
+    cond_max = 1e7
 
     a_min = 5e-7
     a_max = 5e-4
@@ -288,7 +258,7 @@ def main():
 
     g = 9.80665
     m_vehicle = 50.0
-    load_factor = 2.5
+    load_factor = 5.0
     total_lift = load_factor * m_vehicle * g
 
     n_iter = 25
@@ -300,14 +270,9 @@ def main():
     nodes, edges = build_lattice(wing, lattice_type)
     areas = np.full(len(edges), a_init, dtype=float)
 
-    # enforce root-connected intact component from the start
     nodes, edges, areas, keep_nodes_intact, _ = filter_to_root_connected_intact(
         nodes, edges, areas, wing
     )
-
-    root_mask = wing.root_mask(nodes)
-    root_nodes = np.where(root_mask)[0]
-    fixed_dofs = make_fixed_dofs_for_root_clamp(nodes, root_mask)
 
     print("Initial design summary:")
     print(f"  lattice type   = {lattice_type}")
@@ -316,7 +281,6 @@ def main():
     print(f"  total lift     = {total_lift:.2f} N")
     print(f"  HDF5 output    = {os.path.abspath(h5_path)}")
 
-    # Visualization of starting design
     if lattice_type == "square":
         visualize_square_lattice(nodes, edges, wing)
 
@@ -334,36 +298,33 @@ def main():
         "damaged_connected": [],
     }
 
+    last_damage_info = None
+
     with h5py.File(h5_path, "w") as h5:
         meta = h5.create_group("meta")
         meta.attrs["lattice_type"] = lattice_type
-        meta.attrs["span"] = wing.span
-        meta.attrs["chord"] = wing.chord
-        meta.attrs["depth"] = wing.depth
-        meta.attrs["E_modulus"] = E_modulus
-        meta.attrs["density"] = density
-        meta.attrs["sigma_allow"] = sigma_allow
-        meta.attrs["u_tip_max"] = u_tip_max
-        meta.attrs["load_factor"] = load_factor
-        meta.attrs["m_vehicle"] = m_vehicle
-        meta.attrs["total_lift"] = total_lift
-        meta.attrs["cond_max"] = cond_max
 
         for it in range(n_iter):
             intact_connected = is_connected_safe(len(nodes), edges)
-
             if not intact_connected:
                 print(f"Iter {it:02d} | intact graph disconnected -> FAIL")
                 break
 
             root_mask = wing.root_mask(nodes)
-            root_nodes = np.where(root_mask)[0]
             fixed_dofs = make_fixed_dofs_for_root_clamp(nodes, root_mask)
 
-            f = distributed_vertical_load_to_nodes(
-                nodes, wing.span, total_lift, distribution="elliptic"
-            )
+            f = distributed_vertical_load_to_nodes(nodes, wing.span, total_lift, distribution="elliptic")
             tip_node_idx = choose_tip_node(nodes, wing)
+
+            tip_coord = nodes[tip_node_idx]
+            max_span_node = int(np.argmax(nodes[:, 1]))
+            max_span_coord = nodes[max_span_node]
+
+            print(
+                f"    intact tip node idx={tip_node_idx} "
+                f"coord=({tip_coord[0]:.3f},{tip_coord[1]:.3f},{tip_coord[2]:.3f}) "
+                f"max_y={max_span_coord[1]:.3f}"
+            )
 
             try:
                 res = solve_truss(
@@ -395,13 +356,9 @@ def main():
             seed = int(np.argmin(np.linalg.norm(nodes - target.reshape(1, 3), axis=1)))
 
             damage_info = damage_and_check_full_connectivity(
-                wing=wing,
-                nodes=nodes,
-                edges=edges,
-                areas=areas,
-                seed=seed,
-                k=damage_k,
+                wing=wing, nodes=nodes, edges=edges, areas=areas, seed=seed, k=damage_k
             )
+            last_damage_info = damage_info
 
             damaged_connected = damage_info["connected"]
             damaged_screen_passed = damage_info.get("graph_screen_passed", False)
@@ -415,6 +372,9 @@ def main():
                 dam_tip_node_idx = -1
                 dam_cond = np.inf
                 damage_reason = "damaged_graph_disconnected_or_screen_failed"
+                nodes_d = np.zeros((0, 3))
+                edges_d = np.zeros((0, 2), dtype=int)
+                areas_d = np.zeros((0,))
             else:
                 nodes_d = damage_info["nodes_d"]
                 edges_d = damage_info["edges_d"]
@@ -422,10 +382,18 @@ def main():
 
                 root_mask_d = wing.root_mask(nodes_d)
                 fixed_dofs_d = make_fixed_dofs_for_root_clamp(nodes_d, root_mask_d)
-                f_d = distributed_vertical_load_to_nodes(
-                    nodes_d, wing.span, total_lift, distribution="elliptic"
-                )
+                f_d = distributed_vertical_load_to_nodes(nodes_d, wing.span, total_lift, distribution="elliptic")
                 dam_tip_node_idx = choose_tip_node(nodes_d, wing)
+
+                tip_coord_d = nodes_d[dam_tip_node_idx]
+                max_span_node_d = int(np.argmax(nodes_d[:, 1]))
+                max_span_coord_d = nodes_d[max_span_node_d]
+
+                print(
+                    f"    damaged tip node idx={dam_tip_node_idx} "
+                    f"coord=({tip_coord_d[0]:.3f},{tip_coord_d[1]:.3f},{tip_coord_d[2]:.3f}) "
+                    f"max_y={max_span_coord_d[1]:.3f}"
+                )
 
                 try:
                     res_d = solve_truss(
@@ -459,34 +427,16 @@ def main():
                     dam_cond = np.inf
                     damage_reason = f"damaged_solve_failed:{err}"
 
-            intact_util = max_sigma / sigma_allow
-            damaged_util = dam_sigma / sigma_allow if np.isfinite(dam_sigma) else np.inf
-
-            if not np.isfinite(dam_cond) or not np.isfinite(dam_tip) or not np.isfinite(dam_sigma):
-                print(f"Iter {it:02d} | baseline design infeasible under damage -> stopping optimization")
-                print(
-                    f"Iter {it:02d} | edges={len(edges):5d} | mass={mass:8.2f} kg | "
-                    f"σ_intact={max_sigma/1e6:7.2f} MPa ({intact_util:5.3f}) | "
-                    f"σ_dmg=inf | u_tip={tip_disp:8.4e} m | u_tip_d=inf | "
-                    f"conn_i={intact_connected} conn_d={damaged_connected} | "
-                    f"cond_i={res.cond_est:.3e} cond_d=inf | {damage_reason}"
-                )
-                break
-
-            # sizing update first
-            areas = simple_sizing_update(
-                areas, res.member_stress, sigma_allow, a_min, a_max
-            )
+            areas = simple_sizing_update(areas, res.member_stress, sigma_allow, a_min, a_max)
 
             edges_before = len(edges)
 
             if it >= prune_after_iter:
-                nodes, edges, areas, removed_edges_idx, prune_ok, prune_reason = try_prune_and_validate(
+                nodes, edges, areas, removed_edges_idx, prune_ok, prune_reason = try_grouped_prune_and_validate(
                     wing=wing,
                     nodes=nodes,
                     edges=edges,
                     areas=areas,
-                    root_nodes=root_nodes,
                     sigma_allow=sigma_allow,
                     res=res,
                     E_modulus=E_modulus,
@@ -496,15 +446,17 @@ def main():
                 )
             else:
                 removed_edges_idx = np.zeros((0,), dtype=int)
-                prune_ok = False
                 prune_reason = "prune_not_attempted"
 
             pruned_now = len(removed_edges_idx)
 
+            intact_util = max_sigma / sigma_allow
+            damaged_util = dam_sigma / sigma_allow if np.isfinite(dam_sigma) else np.inf
+
             print(
                 f"Iter {it:02d} | edges={len(edges):5d} | mass={mass:8.2f} kg | "
                 f"σ_intact={max_sigma/1e6:7.2f} MPa ({intact_util:5.3f}) | "
-                f"σ_dmg={dam_sigma/1e6:7.2f} MPa ({damaged_util:5.3f}) | "
+                f"σ_dmg={dam_sigma/1e6 if np.isfinite(dam_sigma) else np.inf:7.2f} MPa ({damaged_util:5.3f}) | "
                 f"u_tip={tip_disp:8.4e} m | u_tip_d={dam_tip:8.4e} m | "
                 f"conn_i={intact_connected} conn_d={damaged_connected} | "
                 f"cond_i={res.cond_est:.3e} cond_d={dam_cond:.3e} | "
@@ -527,18 +479,22 @@ def main():
                     "max_sigma": max_sigma,
                     "lambda2": lambda2,
                     "tip_node_idx": tip_node_idx,
+                    "tip_coord": tip_coord,
+                    "max_span_coord": max_span_coord,
                     "cond_est": res.cond_est,
                     "intact_connected": intact_connected,
                     "ebc_stats": ebc_stats,
                     "damage_reason": damage_reason,
-                    "damaged_nodes": damage_info["nodes_d"] if damaged_connected else np.zeros((0, 3)),
-                    "damaged_edges": damage_info["edges_d"] if damaged_connected else np.zeros((0, 2), dtype=int),
-                    "damaged_areas": damage_info["areas_d"] if damaged_connected else np.zeros((0,)),
+                    "damaged_nodes": nodes_d if damaged_connected else np.zeros((0, 3)),
+                    "damaged_edges": edges_d if damaged_connected else np.zeros((0, 2), dtype=int),
+                    "damaged_areas": areas_d if damaged_connected else np.zeros((0,)),
                     "removed_nodes_damage_original_idx": damage_info["removed_nodes_original_idx"],
                     "damaged_tip_disp": dam_tip,
                     "damaged_max_sigma": dam_sigma,
                     "damaged_lambda2": dam_lambda2,
                     "damaged_tip_node_idx": dam_tip_node_idx,
+                    "damaged_tip_coord": tip_coord_d if damaged_connected else np.array([np.nan, np.nan, np.nan]),
+                    "damaged_max_span_coord": max_span_coord_d if damaged_connected else np.array([np.nan, np.nan, np.nan]),
                     "damaged_cond_est": dam_cond,
                     "damaged_connected": damaged_connected,
                     "damaged_graph_screen_passed": damaged_screen_passed,
@@ -553,7 +509,7 @@ def main():
             hist["tip_intact"].append(tip_disp)
             hist["tip_damaged"].append(dam_tip)
             hist["sigma_intact"].append(max_sigma / 1e6)
-            hist["sigma_damaged"].append(dam_sigma / 1e6)
+            hist["sigma_damaged"].append(dam_sigma / 1e6 if np.isfinite(dam_sigma) else np.nan)
             hist["n_edges"].append(edges_before)
             hist["lambda2_intact"].append(lambda2)
             hist["lambda2_damaged"].append(dam_lambda2)
@@ -586,23 +542,13 @@ def main():
         plt.tight_layout()
         plt.show()
 
-    # optional damage visualization for square lattice
-    if lattice_type == "square" and len(nodes) > 0 and len(edges) > 0:
-        target = np.array([0.5 * wing.chord, 0.6 * wing.span, 0.0])
-        seed = int(np.argmin(np.linalg.norm(nodes - target.reshape(1, 3), axis=1)))
-        damage_info = damage_and_check_full_connectivity(
-            wing=wing,
-            nodes=nodes,
-            edges=edges,
-            areas=areas,
-            seed=seed,
-            k=damage_k,
-        )
+    if lattice_type == "square" and last_damage_info is not None:
         visualize_damage_on_square_lattice(
             nodes,
             edges,
-            damage_info["removed_nodes_original_idx"],
-            wing,
+            last_damage_info["removed_nodes_original_idx"],
+            surviving_nodes=last_damage_info["nodes_d"] if last_damage_info["connected"] else None,
+            surviving_edges=last_damage_info["edges_d"] if last_damage_info["connected"] else None,
         )
 
     print(f"\nSaved debug data to HDF5: {os.path.abspath(h5_path)}")

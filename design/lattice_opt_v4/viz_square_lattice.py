@@ -3,13 +3,6 @@ import matplotlib.pyplot as plt
 
 
 def classify_square_lattice_edges(nodes, edges, tol=0.90):
-    """
-    Classify edges by dominant direction:
-      - spanwise (y)
-      - chordwise (x)
-      - vertical (z)
-      - diagonal (everything else)
-    """
     p = nodes[edges[:, 0]]
     q = nodes[edges[:, 1]]
     d = q - p
@@ -106,7 +99,6 @@ def visualize_square_lattice(nodes, edges, wing, slice_stations=(0.2, 0.5, 0.8))
     print(f"  vertical members      = {np.sum(vertical)}")
     print(f"  diagonal members      = {np.sum(diagonal)}")
 
-    # 3D combined colored view
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection="3d")
     plot_edges_3d(ax, nodes, edges, spanwise, stride=1, color="C0", alpha=0.9, lw=1.0)
@@ -117,7 +109,6 @@ def visualize_square_lattice(nodes, edges, wing, slice_stations=(0.2, 0.5, 0.8))
     plt.tight_layout()
     plt.show()
 
-    # orthographic projections
     fig2, axs = plt.subplots(1, 3, figsize=(16, 5))
 
     plot_edges_2d(axs[0], nodes, edges, plane="xy", mask=spanwise, stride=1, color="C0", alpha=0.9, lw=1.0)
@@ -135,58 +126,47 @@ def visualize_square_lattice(nodes, edges, wing, slice_stations=(0.2, 0.5, 0.8))
     plot_edges_2d(axs[2], nodes, edges, plane="xz", mask=diagonal, stride=1, color="0.5", alpha=0.35, lw=0.7)
     axs[2].set_title("Chord-depth view (x-z)")
 
-    for ax in axs:
-        ax.set_aspect("equal", adjustable="box")
-
-    plt.tight_layout()
-    plt.show()
-
-    # spanwise slices
-    fig3, axs = plt.subplots(1, len(slice_stations), figsize=(5 * len(slice_stations), 5))
-    if len(slice_stations) == 1:
-        axs = [axs]
-
-    p = nodes[edges[:, 0]]
-    q = nodes[edges[:, 1]]
-
-    for ax, frac in zip(axs, slice_stations):
-        y0 = frac * wing.span
-        band = 0.06 * wing.span
-
-        mask = (np.abs(p[:, 1] - y0) <= band) | (np.abs(q[:, 1] - y0) <= band)
-
-        local_edges = edges[mask]
-        c2, s2, v2, d2 = classify_square_lattice_edges(nodes, local_edges)
-
-        plot_edges_2d(ax, nodes, local_edges, plane="xz", mask=s2, stride=1, color="C0", alpha=0.9, lw=1.0)
-        plot_edges_2d(ax, nodes, local_edges, plane="xz", mask=c2, stride=1, color="C1", alpha=0.9, lw=1.0)
-        plot_edges_2d(ax, nodes, local_edges, plane="xz", mask=v2, stride=1, color="C2", alpha=0.9, lw=1.0)
-        plot_edges_2d(ax, nodes, local_edges, plane="xz", mask=d2, stride=1, color="0.5", alpha=0.35, lw=0.7)
-
-        ax.set_title(f"Slice near y/b = {frac:.2f}")
-        ax.set_aspect("equal", adjustable="box")
+    # for ax in axs:
+    #     ax.set_aspect("equal", adjustable="box")
 
     plt.tight_layout()
     plt.show()
 
 
-def visualize_damage_on_square_lattice(nodes, edges, removed_node_indices, wing):
+def visualize_damage_on_square_lattice(nodes, edges, removed_node_indices, surviving_nodes=None, surviving_edges=None):
     chordwise, spanwise, vertical, diagonal = classify_square_lattice_edges(nodes, edges)
 
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection="3d")
+    fig = plt.figure(figsize=(18, 6))
 
-    plot_edges_3d(ax, nodes, edges, spanwise, stride=1, color="C0", alpha=0.35, lw=0.8)
-    plot_edges_3d(ax, nodes, edges, chordwise, stride=1, color="C1", alpha=0.35, lw=0.8)
-    plot_edges_3d(ax, nodes, edges, vertical, stride=1, color="C2", alpha=0.35, lw=0.8)
-    plot_edges_3d(ax, nodes, edges, diagonal, stride=1, color="0.5", alpha=0.20, lw=0.6)
-
-    removed_node_indices = np.asarray(removed_node_indices, dtype=int)
+    # Original with damage markers
+    ax1 = fig.add_subplot(131, projection="3d")
+    plot_edges_3d(ax1, nodes, edges, spanwise, stride=1, color="C0", alpha=0.20, lw=0.8)
+    plot_edges_3d(ax1, nodes, edges, chordwise, stride=1, color="C1", alpha=0.20, lw=0.8)
+    plot_edges_3d(ax1, nodes, edges, vertical, stride=1, color="C2", alpha=0.20, lw=0.8)
+    plot_edges_3d(ax1, nodes, edges, diagonal, stride=1, color="0.5", alpha=0.12, lw=0.6)
     if len(removed_node_indices) > 0:
-        pts = nodes[removed_node_indices]
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], color="red", s=30, label="Damaged nodes")
-        ax.legend()
+        pts = nodes[np.asarray(removed_node_indices, dtype=int)]
+        ax1.scatter(pts[:, 0], pts[:, 1], pts[:, 2], color="red", s=35, label="Removed nodes")
+        ax1.legend()
+    ax1.set_title("Original lattice + removed nodes")
 
-    ax.set_title("Square lattice with damaged nodes highlighted")
+    # Removed edges only
+    ax2 = fig.add_subplot(132, projection="3d")
+    if len(removed_node_indices) > 0:
+        removed_set = set(np.asarray(removed_node_indices, dtype=int).tolist())
+        removed_edge_mask = np.array([(i in removed_set) or (j in removed_set) for i, j in edges], dtype=bool)
+        plot_edges_3d(ax2, nodes, edges, removed_edge_mask, stride=1, color="red", alpha=0.85, lw=1.0)
+    ax2.set_title("Edges incident to removed nodes")
+
+    # Surviving root-connected component
+    ax3 = fig.add_subplot(133, projection="3d")
+    if surviving_nodes is not None and surviving_edges is not None and len(surviving_edges) > 0:
+        c2, s2, v2, d2 = classify_square_lattice_edges(surviving_nodes, surviving_edges)
+        plot_edges_3d(ax3, surviving_nodes, surviving_edges, s2, stride=1, color="C0", alpha=0.9, lw=1.0)
+        plot_edges_3d(ax3, surviving_nodes, surviving_edges, c2, stride=1, color="C1", alpha=0.9, lw=1.0)
+        plot_edges_3d(ax3, surviving_nodes, surviving_edges, v2, stride=1, color="C2", alpha=0.9, lw=1.0)
+        plot_edges_3d(ax3, surviving_nodes, surviving_edges, d2, stride=1, color="0.4", alpha=0.35, lw=0.7)
+    ax3.set_title("Surviving root-connected damaged graph")
+
     plt.tight_layout()
     plt.show()
