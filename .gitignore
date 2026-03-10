@@ -3,3 +3,8 @@
 *.h5
 *.pyc
 **/archive/
+*.gif
+*.png
+*.svg
+*.mp4
+**/lattice_opt_frames_square/
