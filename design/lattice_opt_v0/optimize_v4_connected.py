@@ -254,7 +254,7 @@ def main():
 
     a_min = 5e-7
     a_max = 5e-4
-    a_init = 5e-5
+    a_init = 2e-5
 
     g = 9.80665
     m_vehicle = 50.0
@@ -263,7 +263,7 @@ def main():
 
     n_iter = 25
     prune_after_iter = 1
-    damage_k = 1
+    damage_k = 0
 
     h5_path = f"lattice_opt_debug_v4_{lattice_type}.h5"
 
