@@ -10,12 +10,14 @@ import imageio.v2 as imageio
 from wingbox_domain import WingBox
 from load_mapping import distributed_vertical_load_to_nodes
 from truss_solver import solve_truss, choose_tip_node
+# from truss_solver import choose_tip_node
 from damage_models import filter_to_root_connected_intact, damage_and_check_full_connectivity
 from gt_metrics import is_connected_safe, algebraic_connectivity_safe, edge_betweenness_stats
 
 from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
 from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, prune_one_group
+# from ResGT_optimizer_adapter import solve_truss
 
 
 # ============================================================
