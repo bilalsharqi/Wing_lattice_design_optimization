@@ -2,6 +2,8 @@ import os
 import json
 import shutil
 import importlib
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -17,6 +19,27 @@ from gt_metrics import is_connected_safe, algebraic_connectivity_safe, edge_betw
 from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
 from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, prune_one_group
+
+
+def make_results_paths(run_name="lattice_opt"):
+    """
+    Create a timestamped results directory and standard subfolders.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = os.path.join(os.getcwd(), "results", f"{run_name}_{ts}")
+
+    paths = {
+        "root": root,
+        "data": os.path.join(root, "data"),
+        "plots": os.path.join(root, "plots"),
+        "frames": os.path.join(root, "frames"),
+        "fem": os.path.join(root, "fem"),
+    }
+
+    for p in paths.values():
+        os.makedirs(p, exist_ok=True)
+
+    return paths
 
 
 def make_fixed_dofs_for_root_clamp(nodes, root_mask):
@@ -69,6 +92,36 @@ def build_lattice(wing, lattice_type):
             ny=21,
             nx=7,
             nz=5,
+        )
+    elif lattice_type == "graded_hex":
+        from generate_graded_hex_wingbox_lattice import generate_graded_hex_wingbox_lattice
+        lat = generate_graded_hex_wingbox_lattice(
+            span=wing.span,
+            chord=wing.chord,
+            depth=wing.depth,
+            ny=14,
+            nx=6,
+            root_cell_scale=0.55,
+            tip_cell_scale=1.45,
+        )
+    elif lattice_type == "two_skin_graded_hex":
+        from generate_two_skin_graded_hex_wingbox_lattice import (
+            generate_two_skin_graded_hex_wingbox_lattice,
+        )
+
+        lat = generate_two_skin_graded_hex_wingbox_lattice(
+            span=wing.span,
+            chord=wing.chord,
+            depth=wing.depth,
+            ny=14,
+            nx=6,
+            root_cell_scale=0.65,
+            tip_cell_scale=1.35,
+            add_skin_diagonals=True,
+            add_verticals=True,
+            add_yz_diagonals=True,
+            add_xz_diagonals=True,
+            add_perimeter_frame=True,
         )
     else:
         raise ValueError(f"Unknown lattice_type='{lattice_type}'")
@@ -514,7 +567,7 @@ def assemble_gif_and_mp4(frame_dir, gif_path, mp4_path, fps=2):
     return True, mp4_ok
 
 
-def save_history_plots(hist, sigma_allow, u_tip_max, out_prefix):
+def save_history_plots(hist, sigma_allow, u_tip_max, summary_svg, summary_png):
     if len(hist["mass"]) == 0:
         return None, None
 
@@ -550,9 +603,6 @@ def save_history_plots(hist, sigma_allow, u_tip_max, out_prefix):
     axs[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-
-    summary_svg = out_prefix + "_summary.svg"
-    summary_png = out_prefix + "_summary.png"
     fig.savefig(summary_png, dpi=200, bbox_inches="tight")
     fig.savefig(summary_svg, bbox_inches="tight")
     plt.close(fig)
@@ -601,7 +651,7 @@ def save_solver_comparison_plot(all_hists, sigma_allow, out_svg, out_png):
     plt.close(fig)
 
 
-def run_backend(backend_name, settings):
+def run_backend(backend_name, settings, results_paths):
     solver = get_solver_function(backend_name)
 
     wing = settings["wing"]
@@ -621,13 +671,23 @@ def run_backend(backend_name, settings):
     damage_k = settings["damage_k"]
     seed_span_fraction = settings["seed_span_fraction"]
     seed_x_fraction = settings["seed_x_fraction"]
-    base_dir = settings["base_dir"]
 
-    prefix = os.path.join(base_dir, f"lattice_opt_{backend_name}_{lattice_type}")
-    h5_path = prefix + ".h5"
-    frame_dir = prefix + "_frames"
-    gif_path = prefix + ".gif"
-    mp4_path = prefix + ".mp4"
+    backend_root = os.path.join(results_paths["root"], backend_name)
+    backend_data = os.path.join(backend_root, "data")
+    backend_plots = os.path.join(backend_root, "plots")
+    backend_frames = os.path.join(backend_root, "frames")
+
+    os.makedirs(backend_root, exist_ok=True)
+    os.makedirs(backend_data, exist_ok=True)
+    os.makedirs(backend_plots, exist_ok=True)
+    os.makedirs(backend_frames, exist_ok=True)
+
+    h5_path = os.path.join(backend_data, f"lattice_opt_{backend_name}_{lattice_type}.h5")
+    frame_dir = backend_frames
+    gif_path = os.path.join(backend_plots, f"lattice_opt_{backend_name}_{lattice_type}.gif")
+    mp4_path = os.path.join(backend_plots, f"lattice_opt_{backend_name}_{lattice_type}.mp4")
+    summary_svg = os.path.join(backend_plots, f"lattice_opt_{backend_name}_{lattice_type}_summary.svg")
+    summary_png = os.path.join(backend_plots, f"lattice_opt_{backend_name}_{lattice_type}_summary.png")
 
     if os.path.isdir(frame_dir):
         shutil.rmtree(frame_dir)
@@ -907,7 +967,7 @@ def run_backend(backend_name, settings):
             areas = prune_out["areas_next"]
 
     gif_ok, mp4_ok = assemble_gif_and_mp4(frame_dir, gif_path, mp4_path, fps=2)
-    summary_svg, summary_png = save_history_plots(hist, sigma_allow, u_tip_max, prefix)
+    summary_svg, summary_png = save_history_plots(hist, sigma_allow, u_tip_max, summary_svg, summary_png)
 
     print(f"Saved debug data to HDF5: {os.path.abspath(h5_path)}")
     if gif_ok:
@@ -931,7 +991,7 @@ def main():
 
     settings = {
         "wing": wing,
-        "lattice_type": "square",
+        "lattice_type": "graded_hex",  # square, graded_hex or octet or two_skin_graded_hex
         "E_modulus": 70e9,
         "density": 2700.0,
         "sigma_allow": 250e6,
@@ -939,7 +999,7 @@ def main():
         "cond_max": 1e7,
         "a_min": 5e-7,
         "a_max": 5e-4,
-        "a_init": 3.175e-5, # 1/8th inches
+        "a_init": 3.175e-5,  # 1/8th inches
         "g": 9.80665,
         "m_vehicle": 50.0,
         "load_factor": 5.0,
@@ -950,20 +1010,21 @@ def main():
         "damage_k": 0,
         "seed_span_fraction": 0.60,
         "seed_x_fraction": 0.50,
-        "base_dir": os.getcwd(),
     }
+
+    results_paths = make_results_paths(f"lattice_opt_{settings['lattice_type']}")
 
     compare_backends = True
     backends = ["truss", "responsegt"] if compare_backends else ["truss"]
 
     all_hists = {}
     for backend_name in backends:
-        hist, _ = run_backend(backend_name, settings)
+        hist, _ = run_backend(backend_name, settings, results_paths)
         all_hists[backend_name] = hist
 
     if len(backends) > 1:
-        comp_svg = os.path.join(settings["base_dir"], f"solver_comparison_{settings['lattice_type']}.svg")
-        comp_png = os.path.join(settings["base_dir"], f"solver_comparison_{settings['lattice_type']}.png")
+        comp_svg = os.path.join(results_paths["plots"], f"solver_comparison_{settings['lattice_type']}.svg")
+        comp_png = os.path.join(results_paths["plots"], f"solver_comparison_{settings['lattice_type']}.png")
         save_solver_comparison_plot(all_hists, settings["sigma_allow"], comp_svg, comp_png)
         print(f"Saved solver comparison SVG: {os.path.abspath(comp_svg)}")
         print(f"Saved solver comparison PNG: {os.path.abspath(comp_png)}")
