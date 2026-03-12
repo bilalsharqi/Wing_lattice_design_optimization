@@ -54,6 +54,7 @@ from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, pr
 # -------------------------
 # truss
 # responsegt
+# beam
 #
 # Output behavior
 # ---------------
@@ -66,7 +67,7 @@ settings = {
     "run": {
         "run_name": "lattice_opt",
         "lattice_type": "square",     # square, graded_hex, two_skin_graded_hex, octet
-        "backends": ["truss", "responsegt"],
+        "backends": ["truss", "responsegt", "beam"],
     },
 
     "solvers": {
@@ -88,6 +89,9 @@ settings = {
     "physics": {
         "g": 9.80665,
         "load_factor": 5.0,
+        "excite_torsion": True,
+        "elastic_axis_x_frac": 0.25,
+        "x_cp_frac": 0.35,
     },
 
     "optimization": {
@@ -111,7 +115,7 @@ settings = {
         "nx": 3,
         "ny": 14,
         "nz": 2,
-        "root_cell_scale": 0.75,
+        "root_cell_scale": 0.5,
         "tip_cell_scale": 1.8,
         "add_xy_diagonals": True,
         "add_yz_diagonals": True,
@@ -262,9 +266,50 @@ def get_solver_function(backend_name):
         return importlib.import_module("truss_solver").solve_truss
     elif backend_name == "responsegt":
         return importlib.import_module("ResGT_optimizer_adapter").solve_truss
+    elif backend_name == "beam":
+        return importlib.import_module("beam_optimizer_adapter").solve_truss
     else:
         raise ValueError(f"Unknown solver backend '{backend_name}'")
 
+
+def _extract_translation_u(u: np.ndarray, n_nodes: int) -> np.ndarray:
+    """Return (n_nodes,3) translations from either 3N (truss/ResGT) or 6N (beam) DOF vectors."""
+    u = np.asarray(u).reshape(-1)
+    if u.size == 3 * n_nodes:
+        return u.reshape(n_nodes, 3)
+    if u.size == 6 * n_nodes:
+        return u.reshape(n_nodes, 6)[:, :3]
+    raise ValueError(
+        f"Unexpected displacement size {u.size}; expected {3*n_nodes} (truss) or {6*n_nodes} (beam)"
+    )
+
+
+
+def build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, distribution="elliptic"):
+    """
+    Build solver load vector.
+    - truss / responsegt: 3N translational force vector
+    - beam: 6N vector with same translational forces plus a spanwise torsional moment
+      My = -(x_cp - elastic_axis_x) * Fz
+    """
+    f3 = distributed_vertical_load_to_nodes(nodes, wing.span, total_lift, distribution=distribution)
+    if backend_name.lower().strip() != "beam":
+        return f3
+
+    n_nodes = nodes.shape[0]
+    f6 = np.zeros(6 * n_nodes, dtype=float)
+    for n in range(n_nodes):
+        f6[6*n:6*n+3] = f3[3*n:3*n+3]
+
+    if physics_settings.get("excite_torsion", False):
+        elastic_axis_x = float(physics_settings.get("elastic_axis_x_frac", 0.25)) * float(wing.chord)
+        x_cp = float(physics_settings.get("x_cp_frac", 0.35)) * float(wing.chord)
+        dx = x_cp - elastic_axis_x
+        for n in range(n_nodes):
+            Fz = f6[6*n + 2]
+            # r x F with r=(dx,0,0), F=(0,0,Fz) -> My = -dx * Fz
+            f6[6*n + 4] += -dx * Fz
+    return f6
 
 def _build_node_adjacency(n_nodes, edges):
     nbrs = [set() for _ in range(n_nodes)]
@@ -373,6 +418,8 @@ def evaluate_damage_case(
 
 def try_grouped_prune_and_validate(
     solver,
+    backend_name,
+    physics_settings,
     wing,
     nodes,
     edges,
@@ -429,8 +476,8 @@ def try_grouped_prune_and_validate(
         trial_fixed_dofs = make_fixed_dofs_for_root_clamp(trial_nodes, trial_root_mask)
 
         try:
-            f_trial = distributed_vertical_load_to_nodes(
-                trial_nodes, wing.span, total_lift, distribution="elliptic"
+            f_trial = build_force_vector(
+                trial_nodes, wing, total_lift, backend_name, physics_settings, distribution="elliptic"
             )
             trial_tip = choose_tip_node(trial_nodes, wing)
             trial_res = solver(
@@ -476,8 +523,8 @@ def try_grouped_prune_and_validate(
         trial_fixed_dofs_d = make_fixed_dofs_for_root_clamp(trial_nodes_d, trial_root_mask_d)
 
         try:
-            f_trial_d = distributed_vertical_load_to_nodes(
-                trial_nodes_d, wing.span, total_lift, distribution="elliptic"
+            f_trial_d = build_force_vector(
+                trial_nodes_d, wing, total_lift, backend_name, physics_settings, distribution="elliptic"
             )
             trial_tip_d = choose_tip_node(trial_nodes_d, wing)
             trial_res_d = solver(
@@ -917,7 +964,7 @@ def run_backend(backend_name, settings, results_paths):
 
             root_mask = wing.root_mask(nodes)
             fixed_dofs = make_fixed_dofs_for_root_clamp(nodes, root_mask)
-            f = distributed_vertical_load_to_nodes(nodes, wing.span, total_lift, distribution="elliptic")
+            f = build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, distribution="elliptic")
             tip_node_idx = choose_tip_node(nodes, wing)
             tip_coord = nodes[tip_node_idx]
             max_span_node_idx = int(np.argmax(nodes[:, 1]))
@@ -939,7 +986,7 @@ def run_backend(backend_name, settings, results_paths):
             lambda2 = algebraic_connectivity_safe(len(nodes), edges)
             ebc_stats = edge_betweenness_stats(len(nodes), edges)
 
-            u_xyz = res.u.reshape(-1, 3)
+            u_xyz = _extract_translation_u(res.u, nodes.shape[0])
             nodes_def = nodes + settings["output"]["deformation_scale"] * u_xyz
             tip_coord_def = nodes_def[tip_node_idx]
             max_span_coord_def = nodes_def[max_span_node_idx]
@@ -987,7 +1034,7 @@ def run_backend(backend_name, settings, results_paths):
                 areas_d = damage_info["areas_d"]
                 root_mask_d = wing.root_mask(nodes_d)
                 fixed_dofs_d = make_fixed_dofs_for_root_clamp(nodes_d, root_mask_d)
-                f_d = distributed_vertical_load_to_nodes(nodes_d, wing.span, total_lift, distribution="elliptic")
+                f_d = build_force_vector(nodes_d, wing, total_lift, backend_name, physics_settings, distribution="elliptic")
                 dam_tip_node_idx = choose_tip_node(nodes_d, wing)
                 dam_tip_coord = nodes_d[dam_tip_node_idx]
                 dam_max_span_node_idx = int(np.argmax(nodes_d[:, 1]))
@@ -1004,7 +1051,7 @@ def run_backend(backend_name, settings, results_paths):
                     else:
                         dam_tip = float(res_d.tip_disp)
                         dam_sigma = float(np.max(np.abs(res_d.member_stress)))
-                        u_d_xyz = res_d.u.reshape(-1, 3)
+                        u_d_xyz = _extract_translation_u(res_d.u, nodes_d.shape[0])
                         nodes_d_def = nodes_d + settings["output"]["deformation_scale"] * u_d_xyz
                         dam_tip_coord_def = nodes_d_def[dam_tip_node_idx]
                         dam_max_span_coord_def = nodes_d_def[dam_max_span_node_idx]
@@ -1029,6 +1076,7 @@ def run_backend(backend_name, settings, results_paths):
                 f"tip_y_i={tip_coord[1]:5.3f}   ymax_i={max_span_coord[1]:5.3f}\n"
                 f"tip_y_d={dam_tip_coord[1] if np.isfinite(dam_tip_coord[1]) else np.nan:5.3f}   ymax_d={dam_max_span_coord[1] if np.isfinite(dam_max_span_coord[1]) else np.nan:5.3f}\n"
                 f"damage_mode={damage_mode}  damage_k={damage_k}\n"
+                f"torsion={'on' if physics_settings.get('excite_torsion', False) else 'off'}  ea={physics_settings.get('elastic_axis_x_frac', 0.25):.2f}c  cp={physics_settings.get('x_cp_frac', 0.35):.2f}c\n"
                 f"damage_reason={damage_reason}\n"
                 f"prev_prune={prev_prune_label}\n"
                 f"deformation_scale={settings['output']['deformation_scale']:g}x"
@@ -1154,6 +1202,8 @@ def run_backend(backend_name, settings, results_paths):
             if it >= prune_after_iter:
                 prune_out = try_grouped_prune_and_validate(
                     solver=solver,
+                    backend_name=backend_name,
+                    physics_settings=physics_settings,
                     wing=wing,
                     nodes=nodes,
                     edges=edges,
