@@ -50,6 +50,19 @@ from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, pr
 # octet
 #   Uses lattice[nx], lattice[ny], lattice[nz]
 #
+# voronoi:
+#   density_scale
+#   root_density_scale, tip_density_scale
+#   use_random_seed, random_seed
+#   min_edge_length
+#   add_perimeter_frame
+#   add_verticals, add_web_diagonals
+#   allow_extra_random_connectors, extra_connector_k
+#   voronoi_mode = "wingbox" or "3d_stochastic"
+#   graph_type = "delaunay"
+#   chaos_level
+#   baseline_seed_count
+#
 # Supported solver backends
 # -------------------------
 # truss
@@ -66,7 +79,7 @@ from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, pr
 settings = {
     "run": {
         "run_name": "lattice_opt",
-        "lattice_type": "square",     # square, graded_hex, two_skin_graded_hex, octet
+        "lattice_type": "voronoi",     # square, graded_hex, two_skin_graded_hex, octet
         "backends": ["truss", "responsegt", "beam"],
     },
 
@@ -123,6 +136,21 @@ settings = {
         "add_skin_diagonals": True,
         "add_verticals": True,
         "add_perimeter_frame": True,
+        "density_scale": 1.0, # here onwards lattice settings are for voronoi
+        "root_density_scale": 1.3,
+        "tip_density_scale": 0.7,
+        "use_random_seed": False,
+        "random_seed": 7,
+        "min_edge_length": 0.05,
+        "add_perimeter_frame": True,
+        "add_verticals": True,
+        "add_web_diagonals": True,
+        "allow_extra_random_connectors": False,
+        "extra_connector_k": 2,
+        "voronoi_mode": "wingbox",     # "wingbox" or "3d_stochastic"
+        "graph_type": "delaunay",
+        "chaos_level": 0.0,
+        "baseline_seed_count": 90,
     },
 
     "output": {
@@ -234,6 +262,29 @@ def build_lattice(wing, lattice_type, lattice_settings):
             add_yz_diagonals=lattice_settings["add_yz_diagonals"],
             add_xz_diagonals=lattice_settings["add_xz_diagonals"],
             add_perimeter_frame=lattice_settings["add_perimeter_frame"],
+        )
+    elif lattice_type == "voronoi":
+        from generate_voronoi_wingbox_lattice import generate_voronoi_wingbox_lattice
+    
+        lat = generate_voronoi_wingbox_lattice(
+            span=wing.span,
+            chord=wing.chord,
+            depth=wing.depth,
+            density_scale=lattice_settings["density_scale"],
+            root_density_scale=lattice_settings["root_density_scale"],
+            tip_density_scale=lattice_settings["tip_density_scale"],
+            use_random_seed=lattice_settings["use_random_seed"],
+            random_seed=lattice_settings["random_seed"],
+            min_edge_length=lattice_settings["min_edge_length"],
+            add_perimeter_frame=lattice_settings["add_perimeter_frame"],
+            add_verticals=lattice_settings["add_verticals"],
+            add_web_diagonals=lattice_settings["add_web_diagonals"],
+            allow_extra_random_connectors=lattice_settings["allow_extra_random_connectors"],
+            extra_connector_k=lattice_settings["extra_connector_k"],
+            mode=lattice_settings["voronoi_mode"],
+            graph_type=lattice_settings["graph_type"],
+            chaos_level=lattice_settings["chaos_level"],
+            baseline_seed_count=lattice_settings["baseline_seed_count"],
         )
     else:
         raise ValueError(f"Unknown lattice_type='{lattice_type}'")
