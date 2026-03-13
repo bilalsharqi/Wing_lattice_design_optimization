@@ -8,4 +8,4 @@
 *.svg
 *.mp4
 *.step
-**/lattice_opt_frames_square/
+**/results/
