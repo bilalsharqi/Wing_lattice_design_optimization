@@ -22,6 +22,7 @@ from gt_metrics import is_connected_safe, algebraic_connectivity_safe, edge_betw
 from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
 from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, prune_one_group
+from export_lattice_to_nastran_bdf import export_lattice_to_nastran
 
 
 # ======================================================================
@@ -79,7 +80,7 @@ from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, pr
 settings = {
     "run": {
         "run_name": "lattice_opt",
-        "lattice_type": "voronoi",     # square, graded_hex, two_skin_graded_hex, octet
+        "lattice_type": "graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
         "backends": ["truss", "responsegt", "beam"],
     },
 
@@ -161,6 +162,9 @@ settings = {
         "show_deformed_shape": True,
         "deformation_scale": 3.0,
         "plot_undeformed_background": True,
+        "export_final_fem": True,
+        "fem_element_length": 0.03,   # meters (3 cm default)
+        "fem_include_loads": False,   # match the loads applied here
     },
 }
 
@@ -309,6 +313,72 @@ def save_iteration_hdf5(h5, it, data_dict):
             grp.attrs[key] = "None"
         else:
             grp.attrs[key] = json.dumps(val)
+
+
+def _write_h5_value(parent, key, val):
+    """Recursively write nested settings/metadata into HDF5."""
+    if isinstance(val, dict):
+        sub = parent.create_group(str(key))
+        for k2, v2 in val.items():
+            _write_h5_value(sub, k2, v2)
+        return
+
+    if val is None:
+        parent.attrs[str(key)] = "None"
+        return
+
+    if isinstance(val, (str, bytes, bool)) or np.isscalar(val):
+        parent.attrs[str(key)] = val
+        return
+
+    if isinstance(val, (list, tuple)):
+        if len(val) == 0:
+            parent.create_dataset(str(key), data=np.asarray([], dtype=float))
+            return
+        if all(isinstance(x, (str, bytes)) for x in val):
+            dt = h5py.string_dtype(encoding="utf-8")
+            parent.create_dataset(str(key), data=np.asarray(val, dtype=dt))
+            return
+        if all(isinstance(x, (bool, np.bool_)) for x in val):
+            parent.create_dataset(str(key), data=np.asarray(val, dtype=bool))
+            return
+        if all(np.isscalar(x) for x in val):
+            parent.create_dataset(str(key), data=np.asarray(val))
+            return
+        parent.attrs[str(key)] = json.dumps(val)
+        return
+
+    if isinstance(val, np.ndarray):
+        if val.dtype.kind in {"U", "O"}:
+            try:
+                dt = h5py.string_dtype(encoding="utf-8")
+                parent.create_dataset(str(key), data=val.astype(dt))
+            except Exception:
+                parent.attrs[str(key)] = json.dumps(val.tolist())
+        else:
+            parent.create_dataset(str(key), data=val, compression="gzip")
+        return
+
+    parent.attrs[str(key)] = json.dumps(val)
+
+
+def write_settings_meta(meta_group, settings, results_paths=None, backend_name=None, lattice_type=None):
+    """Write full run settings and context into /meta."""
+    if backend_name is not None:
+        meta_group.attrs["solver_backend"] = backend_name
+    if lattice_type is not None:
+        meta_group.attrs["lattice_type"] = lattice_type
+
+    meta_group.attrs["settings_json"] = json.dumps(settings, indent=2)
+
+    settings_group = meta_group.create_group("settings")
+    for section_name, section_val in settings.items():
+        _write_h5_value(settings_group, section_name, section_val)
+
+    if results_paths is not None:
+        paths_group = meta_group.create_group("results_paths")
+        for k, v in results_paths.items():
+            _write_h5_value(paths_group, k, v)
 
 
 def get_solver_function(backend_name):
@@ -1004,8 +1074,13 @@ def run_backend(backend_name, settings, results_paths):
 
     with h5py.File(h5_path, "w") as h5:
         meta = h5.create_group("meta")
-        meta.attrs["solver_backend"] = backend_name
-        meta.attrs["lattice_type"] = lattice_type
+        write_settings_meta(
+            meta_group=meta,
+            settings=settings,
+            results_paths=results_paths,
+            backend_name=backend_name,
+            lattice_type=lattice_type,
+        )
 
         for it in range(n_iter):
             intact_connected = is_connected_safe(len(nodes), edges)
@@ -1287,6 +1362,35 @@ def run_backend(backend_name, settings, results_paths):
 
     gif_ok, mp4_ok = assemble_gif_and_mp4(frame_dir, gif_path, mp4_path, fps=output_settings["fps"])
     summary_svg, summary_png = save_history_plots(hist, sigma_allow, u_tip_max, summary_svg, summary_png)
+    
+    # ==============================================================
+    # Export NASTRAN FEM for final lattice
+    # ==============================================================
+
+    if settings["output"].get("export_final_fem", False):
+
+        try:
+
+            fem_path = os.path.join(
+                backend_data,
+                f"lattice_final_{backend_name}_{lattice_type}.bdf"
+            )
+
+            export_lattice_to_nastran(
+                h5_file=h5_path,
+                iteration=it,
+                nodes=nodes,
+                edges=edges,
+                areas=areas,
+                element_length=settings["output"].get("fem_element_length", 0.01),
+                include_loads=settings["output"].get("fem_include_loads", False),
+                output_bdf=fem_path
+            )
+
+            print(f"Final FEM exported: {fem_path}")
+
+        except Exception as err:
+            print("FEM export failed:", err)
 
     print(f"Saved debug data to HDF5: {os.path.abspath(h5_path)}")
     if gif_ok:
