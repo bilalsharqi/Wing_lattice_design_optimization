@@ -109,9 +109,10 @@ settings = {
     },
 
     "optimization": {
+        "enable_area_sizing": False,
         "a_min": 5e-7,
         "a_max": 5e-4,
-        "a_init": 3.175e-5,
+        "a_init": 5e-5,
         "max_iterations": 25,
         "prune_after_iter": 1,
         "shrink_factor": 0.970,
@@ -1315,15 +1316,18 @@ def run_backend(backend_name, settings, results_paths):
             hist["n_edges"].append(len(edges))
             hist["pruned_count_prev"].append(len(prev_prune_removed_edge_coords))
 
-            areas_after_sizing = simple_sizing_update(
-                areas,
-                res.member_stress,
-                sigma_allow,
-                a_min,
-                a_max,
-                shrink_factor=optimization_settings["shrink_factor"],
-                grow_factor=optimization_settings["grow_factor"],
-            )
+            if optimization_settings.get("enable_area_sizing", True):
+                areas_after_sizing = simple_sizing_update(
+                    areas,
+                    res.member_stress,
+                    sigma_allow,
+                    a_min,
+                    a_max,
+                    shrink_factor=optimization_settings["shrink_factor"],
+                    grow_factor=optimization_settings["grow_factor"],
+                )
+            else:
+                areas_after_sizing = areas.copy()
 
             if it >= prune_after_iter:
                 prune_out = try_grouped_prune_and_validate(
@@ -1372,19 +1376,17 @@ def run_backend(backend_name, settings, results_paths):
         try:
 
             fem_path = os.path.join(
-                backend_data,
+                backend_fem,
                 f"lattice_final_{backend_name}_{lattice_type}.bdf"
             )
-
+            
             export_lattice_to_nastran(
                 h5_file=h5_path,
+                output_bdf=fem_path,
                 iteration=it,
-                nodes=nodes,
-                edges=edges,
-                areas=areas,
-                element_length=settings["output"].get("fem_element_length", 0.01),
-                include_loads=settings["output"].get("fem_include_loads", False),
-                output_bdf=fem_path
+                target_element_length=settings["output"].get("fem_element_length", 0.03),
+                write_active_loads=settings["output"].get("fem_include_loads", False),
+                write_active_moments=settings["output"].get("fem_include_loads", False),
             )
 
             print(f"Final FEM exported: {fem_path}")
