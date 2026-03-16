@@ -74,9 +74,9 @@ def make_lc(ax, segs, values, cmap, linewidth):
     return lc
 
 
-def main():
+def plot_ebc_vs_stress_lattice(H5_FILE, ITERATION="final", OUTPUT_DIR=""):
     if not H5_FILE:
-        raise RuntimeError("Set H5_FILE at the top of the script")
+        raise RuntimeError("H5_FILE must be provided")
 
     out_dir = OUTPUT_DIR if OUTPUT_DIR else os.path.join(
         os.path.dirname(os.path.abspath(H5_FILE)),

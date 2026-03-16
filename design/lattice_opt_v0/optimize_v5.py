@@ -27,6 +27,8 @@ from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
 from grouped_pruning import build_spanwise_bay_groups, evaluate_group_scores, prune_one_group
 from export_lattice_to_nastran_bdf import export_lattice_to_nastran
+from plot_ebc_vs_stress_lattice import plot_ebc_vs_stress_lattice
+from analyze_ebc_lb_correlation import analyze_ebc_lb_correlation
 
 
 # ======================================================================
@@ -103,7 +105,7 @@ from export_lattice_to_nastran_bdf import export_lattice_to_nastran
 settings = {
     "run": {
         "run_name": "lattice_opt",
-        "lattice_type": "two_skin_graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
+        "lattice_type": "graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
         "backends": ["beam"],
     },
 
@@ -133,7 +135,7 @@ settings = {
 
     "optimization": {
         "enable_area_sizing": True,
-        "prune_score_mode": "hybrid",
+        "prune_score_mode": "ebc_only",
         "ebc_backbone_veto": True,
         "ebc_bcrit": 0.80,
         "w_sigma": 0.50,
@@ -142,7 +144,7 @@ settings = {
         "ebc_weight_mode": "auto",
         "a_min": 5e-7,
         "a_max": 5e-4,
-        "a_init": 3.175e-5,
+        "a_init": 5e-5,
         "max_iterations": 25,
         "prune_after_iter": 1,
         "shrink_factor": 0.970,
@@ -196,6 +198,8 @@ settings = {
         "export_final_fem": True,
         "fem_element_length": 0.03,   # meters (3 cm default)
         "fem_include_loads": False,   # match the loads applied here
+        "export_ebc_plots": True,
+        "ebc_plot_iteration": "final",
     },
 }
 
@@ -1117,6 +1121,30 @@ def save_solver_comparison_plot(all_hists, sigma_allow, out_svg, out_png):
     plt.close(fig)
 
 
+
+
+def export_ebc_outputs_for_backend(h5_path, settings):
+    output_settings = settings["output"]
+    if not output_settings.get("export_ebc_plots", False):
+        return []
+
+    iter_sel = output_settings.get("ebc_plot_iteration", "final")
+    h5_dir = os.path.dirname(os.path.abspath(h5_path))
+    vis_dir = os.path.join(h5_dir, "gt_metric_visual_all_weights")
+    analysis_dir = os.path.join(h5_dir, "gt_metric_analysis")
+
+    plot_ebc_vs_stress_lattice(
+        H5_FILE=h5_path,
+        ITERATION=iter_sel,
+        OUTPUT_DIR=vis_dir,
+    )
+    analyze_ebc_lb_correlation(
+        H5_FILE=h5_path,
+        ITERATION=iter_sel,
+        OUTPUT_DIR=analysis_dir,
+    )
+    return [vis_dir, analysis_dir]
+
 def run_backend(backend_name, settings, results_paths):
     solver = get_solver_function(backend_name)
 
@@ -1533,6 +1561,12 @@ def run_backend(backend_name, settings, results_paths):
         except Exception as err:
             print("FEM export failed:", err)
 
+    ebc_dirs = []
+    try:
+        ebc_dirs = export_ebc_outputs_for_backend(h5_path, settings)
+    except Exception as err:
+        print(f"EBC export failed: {err}")
+
     print(f"Saved debug data to HDF5: {os.path.abspath(h5_path)}")
     if gif_ok:
         print(f"Saved GIF: {os.path.abspath(gif_path)}")
@@ -1540,6 +1574,8 @@ def run_backend(backend_name, settings, results_paths):
         print(f"Saved MP4: {os.path.abspath(mp4_path)}")
     if summary_svg is not None:
         print(f"Saved summary SVG: {os.path.abspath(summary_svg)}")
+    for d in ebc_dirs:
+        print(f"Saved EBC outputs in: {os.path.abspath(d)}")
 
     return hist, {
         "h5": h5_path,

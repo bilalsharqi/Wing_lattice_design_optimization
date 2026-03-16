@@ -185,9 +185,9 @@ def analyze_one_mode(out_dir, mode, nodes, edges, stress, force_vector, areas, E
 # Main
 # ============================================================
 
-def main():
+def analyze_ebc_lb_correlation(H5_FILE, ITERATION="final", OUTPUT_DIR=""):
     if not H5_FILE:
-        raise RuntimeError("Set H5_FILE at the top of the script")
+        raise RuntimeError("H5_FILE must be provided")
     out_dir = OUTPUT_DIR if OUTPUT_DIR else os.path.join(os.path.dirname(os.path.abspath(H5_FILE)), "gt_metric_analysis")
     os.makedirs(out_dir, exist_ok=True)
 
