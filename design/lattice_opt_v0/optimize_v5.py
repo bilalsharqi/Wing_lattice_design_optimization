@@ -18,6 +18,10 @@ from load_mapping import distributed_vertical_load_to_nodes
 from truss_solver import choose_tip_node
 from damage_models import filter_to_root_connected_intact, damage_and_check_full_connectivity
 from gt_metrics import is_connected_safe, algebraic_connectivity_safe, edge_betweenness_stats
+try:
+    from gt_metrics_updated import edge_boundary_betweenness_load_weighted, loaded_source_nodes, root_boundary_nodes
+except ImportError:
+    from gt_metrics import edge_boundary_betweenness_load_weighted, loaded_source_nodes, root_boundary_nodes
 
 from generate_octet_lattice import generate_octet_ground_structure
 from generate_square_lattice import generate_square_wingbox_lattice
@@ -75,13 +79,32 @@ from export_lattice_to_nastran_bdf import export_lattice_to_nastran
 # Each run is saved to:
 #   results/<run_name>_<timestamp>/
 # with backend-specific subfolders for data, plots, frames, and FEM exports.
+#
+# Key switches:
+#
+# prune_score_mode:
+# "stress_only" → original pruning strategy
+# "ebc_only" → ranking purely by EBC
+# "hybrid" → stress + EBC + mass weighting
+# "random" → random baseline (useful for comparison)
+#
+# ebc_backbone_veto:
+# True → protects high-EBC members from pruning
+# False → no protection
+#
+# ebc_weight_mode:
+# "length" → w_e = L_e
+# "area_scaled" → w_e = L_e / A_e
+# "compliance" → w_e = L_e / (E A_e)
+# "auto" → automatically select based on lattice type
 # ======================================================================
+
 
 settings = {
     "run": {
         "run_name": "lattice_opt",
-        "lattice_type": "graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
-        "backends": ["truss", "responsegt", "beam"],
+        "lattice_type": "two_skin_graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
+        "backends": ["beam"],
     },
 
     "solvers": {
@@ -109,10 +132,17 @@ settings = {
     },
 
     "optimization": {
-        "enable_area_sizing": False,
+        "enable_area_sizing": True,
+        "prune_score_mode": "hybrid",
+        "ebc_backbone_veto": True,
+        "ebc_bcrit": 0.80,
+        "w_sigma": 0.50,
+        "w_ebc": 0.40,
+        "w_mass": 0.10,
+        "ebc_weight_mode": "auto",
         "a_min": 5e-7,
         "a_max": 5e-4,
-        "a_init": 5e-5,
+        "a_init": 3.175e-5,
         "max_iterations": 25,
         "prune_after_iter": 1,
         "shrink_factor": 0.970,
@@ -169,6 +199,12 @@ settings = {
     },
 }
 
+# recommended defaults for EBC_LB weighting for different lattices
+
+if settings["run"]["lattice_type"] == "voronoi":
+    settings["optimization"]["ebc_weight_mode"] = "length"
+elif settings["run"]["lattice_type"] in ["graded_hex", "two_skin_graded_hex"]:
+    settings["optimization"]["ebc_weight_mode"] = "area_scaled"
 
 def make_results_paths(base_dir, run_name="lattice_opt"):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -433,6 +469,56 @@ def build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, 
             f6[6*n + 4] += -dx * Fz
     return f6
 
+def choose_ebc_weight_mode(lattice_type, optimization_settings):
+    mode = optimization_settings.get("ebc_weight_mode", "auto")
+    if mode != "auto":
+        return mode
+
+    lt = str(lattice_type).lower().strip()
+    if lt == "voronoi":
+        return "length"
+    if lt in ("graded_hex", "two_skin_graded_hex", "square"):
+        return "area_scaled"
+    return "length"
+
+
+def compute_edge_ebc_for_current_design(
+    nodes,
+    edges,
+    areas,
+    force_vector,
+    E_modulus,
+    lattice_type,
+    optimization_settings,
+):
+    if len(edges) == 0:
+        return np.zeros((0,), dtype=float), "length"
+
+    ebc_weight_mode = choose_ebc_weight_mode(lattice_type, optimization_settings)
+
+    source_nodes, source_weights = loaded_source_nodes(
+        force_vector,
+        n_nodes=nodes.shape[0],
+        dof_per_node=None,
+        component=2,
+        atol=1e-12,
+    )
+    target_nodes = root_boundary_nodes(nodes, axis=1, tol=None)
+
+    edge_ebc = edge_boundary_betweenness_load_weighted(
+        nodes=nodes,
+        edges=edges,
+        source_nodes=source_nodes,
+        target_nodes=target_nodes,
+        source_weights=source_weights,
+        edge_weight_mode=ebc_weight_mode,
+        areas=areas,
+        E=E_modulus,
+        normalized=True,
+    )
+    return edge_ebc, ebc_weight_mode
+
+
 def _build_node_adjacency(n_nodes, edges):
     nbrs = [set() for _ in range(n_nodes)]
     for i, j in edges:
@@ -553,6 +639,10 @@ def try_grouped_prune_and_validate(
     cond_max,
     damage_mode,
     damage_k,
+    lattice_type,
+    optimization_settings,
+    density,
+    iteration_index=None,
 ):
     groups, labels = build_spanwise_bay_groups(nodes, edges, wing, n_span_bins=14)
     print(f"  grouped pruning: {len(groups)} candidate groups")
@@ -567,19 +657,47 @@ def try_grouped_prune_and_validate(
             "prune_ok": False,
             "prune_reason": "no_groups_available",
             "accepted_label": "",
+            "edge_ebc": np.zeros((len(edges),), dtype=float),
+            "ebc_weight_mode": "length",
+            "group_score_metrics": {},
         }
 
-    scores = evaluate_group_scores(
-        edges,
-        areas,
-        res.member_force,
-        res.member_stress,
-        groups,
-        sigma_allow,
+    f_current = build_force_vector(
+        nodes, wing, total_lift, backend_name, physics_settings, distribution="elliptic"
+    )
+    edge_ebc, ebc_weight_mode = compute_edge_ebc_for_current_design(
+        nodes=nodes,
+        edges=edges,
+        areas=areas,
+        force_vector=f_current,
+        E_modulus=E_modulus,
+        lattice_type=lattice_type,
+        optimization_settings=optimization_settings,
+    )
+
+    scores, veto_mask, group_score_metrics = evaluate_group_scores(
+        nodes=nodes,
+        edges=edges,
+        areas=areas,
+        member_stress=res.member_stress,
+        sigma_allow=sigma_allow,
+        groups=groups,
+        density=density,
+        prune_score_mode=optimization_settings.get("prune_score_mode", "hybrid"),
+        edge_ebc=edge_ebc,
+        ebc_backbone_veto=optimization_settings.get("ebc_backbone_veto", True),
+        ebc_bcrit=optimization_settings.get("ebc_bcrit", 0.80),
+        w_sigma=optimization_settings.get("w_sigma", 0.50),
+        w_ebc=optimization_settings.get("w_ebc", 0.40),
+        w_mass=optimization_settings.get("w_mass", 0.10),
+        random_state=iteration_index,
     )
     order = np.argsort(scores)
 
     for idx in order:
+        if not np.isfinite(scores[idx]):
+            continue
+
         gidx = groups[idx]
         glabel = labels[idx]
 
@@ -677,6 +795,9 @@ def try_grouped_prune_and_validate(
             "prune_ok": True,
             "prune_reason": f"prune_accepted_{glabel}",
             "accepted_label": glabel,
+            "edge_ebc": edge_ebc,
+            "ebc_weight_mode": ebc_weight_mode,
+            "group_score_metrics": group_score_metrics,
         }
 
     return {
@@ -688,6 +809,9 @@ def try_grouped_prune_and_validate(
         "prune_ok": False,
         "prune_reason": "prune_rejected_all_groups",
         "accepted_label": "",
+        "edge_ebc": edge_ebc,
+        "ebc_weight_mode": ebc_weight_mode,
+        "group_score_metrics": group_score_metrics,
     }
 
 
@@ -1084,6 +1208,11 @@ def run_backend(backend_name, settings, results_paths):
         )
 
         for it in range(n_iter):
+            prune_out = {
+            "edge_ebc": np.zeros((len(edges),), dtype=float),
+            "ebc_weight_mode": "length",
+            "group_score_metrics": {},
+            }
             intact_connected = is_connected_safe(len(nodes), edges)
             if not intact_connected:
                 print(f"Iter {it:02d} | intact graph disconnected -> FAIL")
@@ -1267,6 +1396,9 @@ def run_backend(backend_name, settings, results_paths):
                 "cond_est": res.cond_est,
                 "intact_connected": intact_connected,
                 "ebc_stats": ebc_stats,
+                "edge_ebc": prune_out.get("edge_ebc", np.zeros((len(edges),), dtype=float)),
+                "ebc_weight_mode": prune_out.get("ebc_weight_mode", "length"),
+                "group_score_metrics": prune_out.get("group_score_metrics", {}),
                 "tip_node_idx": tip_node_idx,
                 "tip_coord": tip_coord,
                 "tip_y": float(tip_coord[1]),
@@ -1345,6 +1477,10 @@ def run_backend(backend_name, settings, results_paths):
                     cond_max=cond_max,
                     damage_mode=damage_mode,
                     damage_k=damage_k,
+                    lattice_type=lattice_type,
+                    optimization_settings=optimization_settings,
+                    density=density,
+                    iteration_index=it,
                 )
             else:
                 prune_out = {
@@ -1356,6 +1492,9 @@ def run_backend(backend_name, settings, results_paths):
                     "prune_ok": False,
                     "prune_reason": "prune_not_attempted",
                     "accepted_label": "",
+                    "edge_ebc": np.zeros((len(edges),), dtype=float),
+                    "ebc_weight_mode": "length",
+                    "group_score_metrics": {},
                 }
 
             prev_prune_removed_edge_coords = prune_out["removed_edges_coords"]
