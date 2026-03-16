@@ -100,28 +100,131 @@ def build_spanwise_bay_groups(nodes, edges, wing, n_span_bins=14, tol=1e-10):
     return groups, group_labels
 
 
-def evaluate_group_scores(edges, areas, member_force, member_stress, groups, sigma_allow):
+def compute_edge_lengths(nodes, edges):
+    p = nodes[edges[:, 0]]
+    q = nodes[edges[:, 1]]
+    return np.linalg.norm(q - p, axis=1)
+
+
+def compute_edge_masses(nodes, edges, areas, density):
+    return density * areas * compute_edge_lengths(nodes, edges)
+
+
+def _safe_group_mean(vals, idx):
+    idx = np.asarray(idx, dtype=int)
+    if idx.size == 0:
+        return np.inf
+    return float(np.mean(vals[idx]))
+
+
+def _safe_group_max(vals, idx):
+    idx = np.asarray(idx, dtype=int)
+    if idx.size == 0:
+        return np.inf
+    return float(np.max(vals[idx]))
+
+
+def _safe_group_mass_fraction(edge_masses, idx, total_mass):
+    idx = np.asarray(idx, dtype=int)
+    if idx.size == 0 or total_mass <= 0.0:
+        return 0.0
+    return float(np.sum(edge_masses[idx]) / total_mass)
+
+
+def evaluate_group_scores(
+    nodes,
+    edges,
+    areas,
+    member_stress,
+    sigma_allow,
+    groups,
+    density,
+    prune_score_mode="hybrid",
+    edge_ebc=None,
+    ebc_backbone_veto=True,
+    ebc_bcrit=0.80,
+    w_sigma=0.50,
+    w_ebc=0.40,
+    w_mass=0.10,
+    random_state=None,
+):
     """
     Score each candidate group for pruning.
-    Prefer groups that are:
-      - low stress
-      - low force
-      - near minimum area
-    Lower score = better pruning candidate
+
+    Returns
+    -------
+    scores : ndarray
+        Lower score means more pruneable. Vetoed groups are set to +inf.
+    veto_mask : ndarray[bool]
+        True for EBC-protected groups.
+    metrics : dict
+        Group-level diagnostics for HDF5/debugging.
     """
-    max_abs_force = max(float(np.max(np.abs(member_force))), 1e-16)
-    min_area = float(np.min(areas))
+    n_groups = len(groups)
+    if n_groups == 0:
+        return (
+            np.zeros((0,), dtype=float),
+            np.zeros((0,), dtype=bool),
+            {
+                "group_mean_util": np.zeros((0,), dtype=float),
+                "group_mean_ebc": np.zeros((0,), dtype=float),
+                "group_max_ebc": np.zeros((0,), dtype=float),
+                "group_mass_fraction": np.zeros((0,), dtype=float),
+            },
+        )
 
-    scores = []
-    for gidx in groups:
-        stress_util = np.mean(np.abs(member_stress[gidx]) / max(sigma_allow, 1e-16))
-        force_util = np.mean(np.abs(member_force[gidx]) / max_abs_force)
-        area_util = np.mean(areas[gidx] / max(min_area, 1e-16))
+    util = np.abs(np.asarray(member_stress).reshape(-1)) / max(float(sigma_allow), 1e-16)
+    edge_masses = compute_edge_masses(nodes, edges, areas, density)
+    total_mass = float(np.sum(edge_masses))
 
-        score = 0.45 * stress_util + 0.45 * force_util + 0.10 * area_util
-        scores.append(score)
+    if edge_ebc is None:
+        edge_ebc = np.zeros((len(edges),), dtype=float)
+    else:
+        edge_ebc = np.asarray(edge_ebc, dtype=float).reshape(-1)
 
-    return np.asarray(scores)
+    group_mean_util = np.zeros((n_groups,), dtype=float)
+    group_mean_ebc = np.zeros((n_groups,), dtype=float)
+    group_max_ebc = np.zeros((n_groups,), dtype=float)
+    group_mass_fraction = np.zeros((n_groups,), dtype=float)
+
+    for gi, gidx in enumerate(groups):
+        group_mean_util[gi] = _safe_group_mean(util, gidx)
+        group_mean_ebc[gi] = _safe_group_mean(edge_ebc, gidx)
+        group_max_ebc[gi] = _safe_group_max(edge_ebc, gidx)
+        group_mass_fraction[gi] = _safe_group_mass_fraction(edge_masses, gidx, total_mass)
+
+    veto_mask = np.zeros((n_groups,), dtype=bool)
+    if ebc_backbone_veto:
+        veto_mask = group_max_ebc > float(ebc_bcrit)
+
+    mode = str(prune_score_mode).lower().strip()
+    if mode == "random":
+        rng = np.random.default_rng(random_state)
+        scores = rng.random(n_groups)
+    elif mode == "stress_only":
+        scores = group_mean_util - 0.10 * group_mass_fraction
+    elif mode == "ebc_only":
+        scores = group_mean_ebc - 0.10 * group_mass_fraction
+    elif mode == "hybrid":
+        scores = (
+            float(w_sigma) * group_mean_util
+            + float(w_ebc) * group_mean_ebc
+            - float(w_mass) * group_mass_fraction
+        )
+    else:
+        raise ValueError(f"Unknown prune_score_mode='{prune_score_mode}'")
+
+    scores = np.asarray(scores, dtype=float)
+    scores[veto_mask] = np.inf
+
+    metrics = {
+        "group_mean_util": group_mean_util,
+        "group_mean_ebc": group_mean_ebc,
+        "group_max_ebc": group_max_ebc,
+        "group_mass_fraction": group_mass_fraction,
+        "group_veto_mask": veto_mask.astype(bool),
+    }
+    return scores, veto_mask, metrics
 
 
 def prune_one_group(edges, areas, group_edge_indices):
