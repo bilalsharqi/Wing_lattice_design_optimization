@@ -9,17 +9,22 @@ import numpy as np
 # ============================================================
 
 # Input optimizer H5
-H5_FILE = r"results\lattice_opt_graded_hex_20260313_163728\beam\data\lattice_opt_beam_graded_hex.h5"
+H5_FILE = r"results\Voronoi\voronoi_area_ON_EBC_veto_OFF_prune_mode_stress\beam\data\lattice_opt_beam_voronoi.h5"
 
 # Which iteration to export: "initial", "final", or integer
 ITERATION = "final"
 
 # Output BDF file
-OUTPUT_BDF = r"results\lattice_opt_graded_hex_20260313_163728\beam\data\lattice_opt_beam_graded_hex.bdf"
+OUTPUT_BDF = r"results\Voronoi\voronoi_area_ON_EBC_veto_OFF_prune_mode_stress\beam\data\lattice_opt_beam_voronoi.bdf"
 
 # Cross-section control
 USE_H5_AINIT = True
 OVERRIDE_AREA = 3.175e-5   # used only if USE_H5_AINIT = False
+
+# Minimum geometric tolerances used to suppress degenerate beam segments
+# that can trigger FEMAP/Nastran colinear-orientation warnings.
+MIN_BEAM_LENGTH = 1e-8         # meters; skip any beam shorter than this
+MIN_ORIENT_NORM = 1e-14        # robustness tolerance for orientation construction
 
 # Beam meshing / subdivision
 TARGET_ELEMENT_LENGTH = 0.03
@@ -41,8 +46,8 @@ PID = 1
 ELEMENT_TYPE = "CBEAM"   # "CBEAM" or "CBAR"
 
 # Optional active loads
-WRITE_ACTIVE_LOADS = True
-WRITE_ACTIVE_MOMENTS = True
+WRITE_ACTIVE_LOADS = False
+WRITE_ACTIVE_MOMENTS = False
 LOAD_ID = 1
 FORCE_SCALE = 1.0
 MOMENT_SCALE = 1.0
@@ -95,30 +100,34 @@ def circular_props_from_area(area):
 
 
 def choose_orientation_vector(x1, x2):
+    """
+    Return a robust, non-axis-aligned vector perpendicular to the beam axis.
+    This avoids FEMAP/Nastran complaints for some perfectly vertical or
+    perfectly horizontal CBEAM segments.
+    """
     axis = np.asarray(x2, dtype=float) - np.asarray(x1, dtype=float)
     L = np.linalg.norm(axis)
-    if L <= 0.0:
-        return np.array([0.0, 1.0, 0.0], dtype=float)
+    if L <= MIN_BEAM_LENGTH:
+        return np.array([0.70710678, 0.70710678, 0.0], dtype=float)
 
     ex = axis / L
-    basis_set = [
-        np.array([1.0, 0.0, 0.0]),
-        np.array([0.0, 1.0, 0.0]),
-        np.array([0.0, 0.0, 1.0]),
-    ]
-    dots = [abs(np.dot(ex, b)) for b in basis_set]
-    ref = basis_set[int(np.argmin(dots))]
 
-    v = np.cross(ex, ref)
-    nv = np.linalg.norm(v)
-    if nv <= 1e-14:
-        ref = np.array([0.0, 1.0, 0.0])
+    # Use skew reference vectors instead of global basis directions
+    refs = [
+        np.array([1.0, 1.0, 1.0], dtype=float),
+        np.array([1.0, -1.0, 2.0], dtype=float),
+        np.array([2.0, 1.0, -1.0], dtype=float),
+    ]
+
+    for ref in refs:
+        ref = ref / np.linalg.norm(ref)
         v = np.cross(ex, ref)
         nv = np.linalg.norm(v)
-        if nv <= 1e-14:
-            return np.array([0.0, 0.0, 1.0], dtype=float)
+        if nv > MIN_ORIENT_NORM:
+            return v / nv
 
-    return v / nv
+    # Final fallback
+    return np.array([0.70710678, 0.70710678, 0.0], dtype=float)
 
 
 def edge_num_elements(length, target_length, rounding_mode):
@@ -242,13 +251,17 @@ def export_lattice_to_nastran(
 
     fem_nodes = nodes.tolist()
     fem_elems = []
+    n_skipped_subdivision = 0
 
     for i, j in edges:
         p0 = nodes[int(i)]
         p1 = nodes[int(j)]
         L = float(np.linalg.norm(p1 - p0))
-        n_elem = edge_num_elements(L, target_element_length, element_count_rounding)
+        if L <= MIN_BEAM_LENGTH:
+            n_skipped_subdivision += 1
+            continue
 
+        n_elem = edge_num_elements(L, target_element_length, element_count_rounding)
         internal_pts = subdivide_edge(p0, p1, n_elem)
 
         chain = [int(i)]
@@ -257,10 +270,20 @@ def export_lattice_to_nastran(
             chain.append(len(fem_nodes) - 1)
         chain.append(int(j))
 
+        # First protection: skip tiny segments during subdivision
         for a, b in zip(chain[:-1], chain[1:]):
+            pa = np.asarray(fem_nodes[a], dtype=float)
+            pb = np.asarray(fem_nodes[b], dtype=float)
+            Lseg = float(np.linalg.norm(pb - pa))
+            if Lseg <= MIN_BEAM_LENGTH:
+                n_skipped_subdivision += 1
+                continue
             fem_elems.append({"ga": a, "gb": b})
 
     fem_nodes = np.asarray(fem_nodes, dtype=float)
+
+    n_skipped_export = 0
+    written_elem_count = 0
 
     with open(output_bdf, "w", encoding="utf-8") as f:
         f.write("SOL 101\n")
@@ -283,6 +306,7 @@ def export_lattice_to_nastran(
         f.write(f"$ Equivalent diameter     : {member_diameter:.9e} m\n")
         f.write(f"$ TARGET_ELEMENT_LENGTH   : {target_element_length} m\n")
         f.write(f"$ ELEMENT_COUNT_ROUNDING  : {element_count_rounding}\n")
+        f.write(f"$ MIN_BEAM_LENGTH         : {MIN_BEAM_LENGTH:.3e} m\n")
         f.write(f"$ Original nodes          : {nodes.shape[0]}\n")
         f.write(f"$ Original edges          : {edges.shape[0]}\n")
         f.write(f"$ FEM nodes               : {fem_nodes.shape[0]}\n")
@@ -304,15 +328,25 @@ def export_lattice_to_nastran(
         for nid, xyz in enumerate(fem_nodes, start=1):
             f.write(ff_line("GRID", nid, None, xyz[0], xyz[1], xyz[2]))
 
-        for eid, elem in enumerate(fem_elems, start=1):
+        # Second protection: skip tiny / degenerate segments again at write time
+        for elem in fem_elems:
             ga = int(elem["ga"]) + 1
             gb = int(elem["gb"]) + 1
-            x = choose_orientation_vector(fem_nodes[ga - 1], fem_nodes[gb - 1])
+            pa = np.asarray(fem_nodes[ga - 1], dtype=float)
+            pb = np.asarray(fem_nodes[gb - 1], dtype=float)
+
+            Lseg = float(np.linalg.norm(pb - pa))
+            if Lseg <= MIN_BEAM_LENGTH:
+                n_skipped_export += 1
+                continue
+
+            x = choose_orientation_vector(pa, pb)
+            written_elem_count += 1
 
             if element_type.upper() == "CBEAM":
-                f.write(ff_line("CBEAM", eid, pid, ga, gb, x[0], x[1], x[2]))
+                f.write(ff_line("CBEAM", written_elem_count, pid, ga, gb, x[0], x[1], x[2]))
             else:
-                f.write(ff_line("CBAR", eid, pid, ga, gb, x[0], x[1], x[2]))
+                f.write(ff_line("CBAR", written_elem_count, pid, ga, gb, x[0], x[1], x[2]))
 
         root_ids = [int(i) + 1 for i in root_nodes.tolist()]
         max_ids_per_line = 8
@@ -354,11 +388,13 @@ def export_lattice_to_nastran(
         "original_nodes": int(nodes.shape[0]),
         "original_edges": int(edges.shape[0]),
         "fem_nodes": int(fem_nodes.shape[0]),
-        "fem_beam_elements": int(len(fem_elems)),
+        "fem_beam_elements": int(written_elem_count),
         "used_area": float(member_area),
         "equivalent_diameter": float(member_diameter),
         "target_element_length": float(target_element_length),
         "element_rounding_mode": str(element_count_rounding),
+        "n_skipped_subdivision": int(n_skipped_subdivision),
+        "n_skipped_export": int(n_skipped_export),
     }
 
 
@@ -399,6 +435,8 @@ def main():
     print(f'Equivalent diameter: {info["equivalent_diameter"]:.9e} m')
     print(f'Target element length: {info["target_element_length"]} m')
     print(f'Element rounding mode: {info["element_rounding_mode"]}')
+    print(f'Skipped short segments during subdivision: {info["n_skipped_subdivision"]}')
+    print(f'Skipped short segments during export: {info["n_skipped_export"]}')
 
 
 if __name__ == "__main__":
