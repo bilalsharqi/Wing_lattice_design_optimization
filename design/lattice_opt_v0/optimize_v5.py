@@ -105,7 +105,7 @@ from analyze_ebc_lb_correlation import analyze_ebc_lb_correlation
 settings = {
     "run": {
         "run_name": "lattice_opt",
-        "lattice_type": "graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
+        "lattice_type": "two_skin_graded_hex",     # square, graded_hex, two_skin_graded_hex, octet
         "backends": ["beam"],
     },
 
@@ -129,13 +129,13 @@ settings = {
         "g": 9.80665,
         "load_factor": 5.0,
         "excite_torsion": True,
-        "elastic_axis_x_frac": 0.25,
-        "x_cp_frac": 0.35,
+        "elastic_axis_x_frac": 0.35,
+        "x_cp_frac": 0.25,
     },
 
     "optimization": {
         "enable_area_sizing": True,
-        "prune_score_mode": "ebc_only",
+        "prune_score_mode": "stress_only",
         "ebc_backbone_veto": True,
         "ebc_bcrit": 0.80,
         "w_sigma": 0.50,
@@ -452,7 +452,7 @@ def build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, 
     Build solver load vector.
     - truss / responsegt: 3N translational force vector
     - beam: 6N vector with same translational forces plus a spanwise torsional moment
-      My = -(x_cp - elastic_axis_x) * Fz
+      My = -(elastic_axis_x - x_cp) * Fz
     """
     f3 = distributed_vertical_load_to_nodes(nodes, wing.span, total_lift, distribution=distribution)
     if backend_name.lower().strip() != "beam":
@@ -464,9 +464,9 @@ def build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, 
         f6[6*n:6*n+3] = f3[3*n:3*n+3]
 
     if physics_settings.get("excite_torsion", False):
-        elastic_axis_x = float(physics_settings.get("elastic_axis_x_frac", 0.25)) * float(wing.chord)
-        x_cp = float(physics_settings.get("x_cp_frac", 0.35)) * float(wing.chord)
-        dx = x_cp - elastic_axis_x
+        elastic_axis_x = float(physics_settings.get("elastic_axis_x_frac", 0.35)) * float(wing.chord)
+        x_cp = float(physics_settings.get("x_cp_frac", 0.25)) * float(wing.chord)
+        dx = elastic_axis_x - x_cp 
         for n in range(n_nodes):
             Fz = f6[6*n + 2]
             # r x F with r=(dx,0,0), F=(0,0,Fz) -> My = -dx * Fz
