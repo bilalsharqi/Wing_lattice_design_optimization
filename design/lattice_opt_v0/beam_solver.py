@@ -10,7 +10,9 @@ from dataclasses import dataclass
 class BeamResult:
     u: np.ndarray
     member_force: np.ndarray
+    member_force_signed: np.ndarray
     member_stress: np.ndarray
+    member_buckling_util: np.ndarray
     tip_disp: float
     tip_node_idx: int
     cond_est: float
@@ -225,7 +227,9 @@ def solve_beam(
     n_edges = edges.shape[0]
     element_end_forces_local = np.zeros((n_edges, 12), dtype=float)
     member_force = np.zeros((n_edges,), dtype=float)
+    member_force_signed = np.zeros((n_edges,), dtype=float)
     member_stress = np.zeros((n_edges,), dtype=float)
+    member_buckling_util = np.zeros((n_edges,), dtype=float)
 
     for e, (i, j) in enumerate(edges):
         dofs = np.array([
@@ -249,7 +253,13 @@ def solve_beam(
         J = math.pi * r**4 / 2.0
         c = r
 
-        N = max(abs(fe_local[0]), abs(fe_local[6]))
+        # Signed axial force from local axial extension:
+        # positive = tension, negative = compression
+        L = lengths[e]
+        axial_extension = float(ue_local[6] - ue_local[0])
+        N_signed = e_modulus * A * axial_extension / L
+        N = abs(N_signed)
+
         Tq = max(abs(fe_local[3]), abs(fe_local[9]))
         My = max(abs(fe_local[4]), abs(fe_local[10]))
         Mz = max(abs(fe_local[5]), abs(fe_local[11]))
@@ -259,8 +269,19 @@ def solve_beam(
         tau_torsion = (Tq * c / J) if J > 0.0 else 0.0
         sigma_vm = math.sqrt((sigma_axial + sigma_bend) ** 2 + 3.0 * tau_torsion ** 2)
 
+        # Euler buckling utilization for compression only
+        # pinned-pinned default at this stage
+        if N_signed < 0.0:
+            K_eff = 1.0
+            P_cr = (math.pi**2 * e_modulus * Iy) / ((K_eff * L) ** 2)
+            buckling_util = (abs(N_signed) / P_cr) if P_cr > 0.0 else np.inf
+        else:
+            buckling_util = 0.0
+
         member_force[e] = N
+        member_force_signed[e] = N_signed
         member_stress[e] = sigma_vm
+        member_buckling_util[e] = buckling_util
 
     if tip_node_idx is None:
         tip_disp = float(np.linalg.norm(u[6*(n_nodes-1):6*(n_nodes-1)+3]))
@@ -271,7 +292,9 @@ def solve_beam(
     return BeamResult(
         u=u,
         member_force=member_force,
+        member_force_signed=member_force_signed,
         member_stress=member_stress,
+        member_buckling_util=member_buckling_util,
         tip_disp=tip_disp,
         tip_node_idx=int(tip_node_idx),
         cond_est=cond_est,

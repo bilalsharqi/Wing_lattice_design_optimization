@@ -135,7 +135,7 @@ settings = {
 
     "optimization": {
         "enable_area_sizing": True,
-        "prune_score_mode": "stress_only",
+        "prune_score_mode": "hybrid",
         "ebc_backbone_veto": True,
         "ebc_bcrit": 0.80,
         "w_sigma": 0.50,
@@ -144,11 +144,18 @@ settings = {
         "ebc_weight_mode": "auto",
         "a_min": 5e-7,
         "a_max": 5e-4,
-        "a_init": 5e-5,
-        "max_iterations": 25,
+        "a_init": 1e-4,
+        "max_iterations": 50,
         "prune_after_iter": 1,
         "shrink_factor": 0.970,
         "grow_factor": 1.08,
+    },
+
+    "buckling": {
+        "enable": True,
+        "buckling_allow": 1.0,
+        "effective_length_factor": 1.0,
+        "shrink_below": 0.20,
     },
 
     "damage": {
@@ -162,8 +169,8 @@ settings = {
         "nx": 3,
         "ny": 14,
         "nz": 2,
-        "root_cell_scale": 0.5,
-        "tip_cell_scale": 1.8,
+        "root_cell_scale": 0.5, # default 0.5 until 3/17
+        "tip_cell_scale": 1.8,  # default 1.8 until 3/17
         "add_xy_diagonals": True,
         "add_yz_diagonals": True,
         "add_xz_diagonals": True,
@@ -246,11 +253,21 @@ def simple_sizing_update(
     a_max,
     shrink_factor=0.970,
     grow_factor=1.08,
+    buckling_util=None,
+    buckling_allow=1.0,
+    shrink_below=0.20,
 ):
-    ratio = np.abs(stress) / max(sigma_allow, 1e-16)
+    stress_ratio = np.abs(stress) / max(sigma_allow, 1e-16)
+    if buckling_util is None:
+        governing_ratio = stress_ratio
+    else:
+        buckling_util = np.asarray(buckling_util, dtype=float).reshape(-1)
+        buckling_ratio = buckling_util / max(float(buckling_allow), 1e-16)
+        governing_ratio = np.maximum(stress_ratio, buckling_ratio)
+
     new_a = areas.copy()
-    new_a[ratio > 1.0] *= grow_factor
-    new_a[ratio < 0.20] *= shrink_factor
+    new_a[governing_ratio > 1.0] *= grow_factor
+    new_a[governing_ratio < shrink_below] *= shrink_factor
     return np.clip(new_a, a_min, a_max)
 
 
@@ -646,6 +663,8 @@ def try_grouped_prune_and_validate(
     lattice_type,
     optimization_settings,
     density,
+    buckling_enable=False,
+    buckling_allow=1.0,
     iteration_index=None,
 ):
     groups, labels = build_spanwise_bay_groups(nodes, edges, wing, n_span_bins=14)
@@ -738,6 +757,11 @@ def try_grouped_prune_and_validate(
             if (not np.isfinite(trial_res.cond_est)) or (trial_res.cond_est > cond_max):
                 print(f"    reject {glabel}: intact mechanism/ill-conditioned (cond={trial_res.cond_est:.3e})")
                 continue
+            if buckling_enable and hasattr(trial_res, "member_buckling_util"):
+                max_buckling_trial = float(np.max(trial_res.member_buckling_util))
+                if max_buckling_trial > buckling_allow:
+                    print(f"    reject {glabel}: intact buckling violation ({max_buckling_trial:.3f} > {buckling_allow:.3f})")
+                    continue
         except Exception as err:
             print(f"    reject {glabel}: intact singular ({err})")
             continue
@@ -785,6 +809,11 @@ def try_grouped_prune_and_validate(
             if (not np.isfinite(trial_res_d.cond_est)) or (trial_res_d.cond_est > cond_max):
                 print(f"    reject {glabel}: damaged mechanism/ill-conditioned (cond={trial_res_d.cond_est:.3e})")
                 continue
+            if buckling_enable and hasattr(trial_res_d, "member_buckling_util"):
+                max_buckling_trial_d = float(np.max(trial_res_d.member_buckling_util))
+                if max_buckling_trial_d > buckling_allow:
+                    print(f"    reject {glabel}: damaged buckling violation ({max_buckling_trial_d:.3f} > {buckling_allow:.3f})")
+                    continue
         except Exception as err:
             print(f"    reject {glabel}: damaged singular ({err})")
             continue
@@ -1153,6 +1182,7 @@ def run_backend(backend_name, settings, results_paths):
     wing_settings = settings["wing"]
     physics_settings = settings["physics"]
     optimization_settings = settings["optimization"]
+    buckling_settings = settings.get("buckling", {})
     damage_settings = settings["damage"]
     lattice_settings = settings["lattice"]
     output_settings = settings["output"]
@@ -1180,6 +1210,8 @@ def run_backend(backend_name, settings, results_paths):
     damage_k = damage_settings["damage_k"]
     seed_span_fraction = damage_settings["seed_span_fraction"]
     seed_x_fraction = damage_settings["seed_x_fraction"]
+    buckling_enable = bool(buckling_settings.get("enable", False))
+    buckling_allow = float(buckling_settings.get("buckling_allow", 1.0))
 
     backend_root = os.path.join(results_paths["root"], backend_name)
     backend_data = os.path.join(backend_root, "data")
@@ -1218,6 +1250,8 @@ def run_backend(backend_name, settings, results_paths):
         "tip_damaged": [],
         "sigma_intact": [],
         "sigma_damaged": [],
+        "buckling_intact": [],
+        "buckling_damaged": [],
         "n_edges": [],
         "pruned_count_prev": [],
     }
@@ -1266,6 +1300,7 @@ def run_backend(backend_name, settings, results_paths):
 
             mass = estimate_mass(nodes, edges, areas, density)
             max_sigma = float(np.max(np.abs(res.member_stress)))
+            max_buckling = float(np.max(res.member_buckling_util)) if hasattr(res, "member_buckling_util") else np.nan
             tip_disp = float(res.tip_disp)
             lambda2 = algebraic_connectivity_safe(len(nodes), edges)
             ebc_stats = edge_betweenness_stats(len(nodes), edges)
@@ -1303,6 +1338,7 @@ def run_backend(backend_name, settings, results_paths):
             dam_max_span_coord = np.array([np.nan, np.nan, np.nan])
             dam_tip = np.inf
             dam_sigma = np.inf
+            dam_buckling = np.inf
             dam_cond = np.inf
             dam_lambda2 = 0.0
             dam_ebc = {"max": np.inf, "mean": np.inf, "var": np.inf}
@@ -1335,6 +1371,7 @@ def run_backend(backend_name, settings, results_paths):
                     else:
                         dam_tip = float(res_d.tip_disp)
                         dam_sigma = float(np.max(np.abs(res_d.member_stress)))
+                        dam_buckling = float(np.max(res_d.member_buckling_util)) if hasattr(res_d, "member_buckling_util") else np.nan
                         u_d_xyz = _extract_translation_u(res_d.u, nodes_d.shape[0])
                         nodes_d_def = nodes_d + settings["output"]["deformation_scale"] * u_d_xyz
                         dam_tip_coord_def = nodes_d_def[dam_tip_node_idx]
@@ -1356,6 +1393,7 @@ def run_backend(backend_name, settings, results_paths):
                 f"edges={len(edges):3d}  pruned_prev={len(prev_prune_removed_edge_coords):1d}\n"
                 f"mass={mass:7.3f} kg\n"
                 f"sigma_i={max_sigma/1e6:7.3f} MPa   sigma_d={dam_sigma/1e6 if np.isfinite(dam_sigma) else np.inf:7.3f} MPa\n"
+                f"buck_i={max_buckling:6.3f}   buck_d={dam_buckling if np.isfinite(dam_buckling) else np.inf:6.3f}\n"
                 f"u_tip_i={tip_disp:8.4e} m   u_tip_d={dam_tip:8.4e} m\n"
                 f"tip_y_i={tip_coord[1]:5.3f}   ymax_i={max_span_coord[1]:5.3f}\n"
                 f"tip_y_d={dam_tip_coord[1] if np.isfinite(dam_tip_coord[1]) else np.nan:5.3f}   ymax_d={dam_max_span_coord[1] if np.isfinite(dam_max_span_coord[1]) else np.nan:5.3f}\n"
@@ -1416,10 +1454,13 @@ def run_backend(backend_name, settings, results_paths):
                 "force_vector": f,
                 "displacements": res.u,
                 "member_force": res.member_force,
+                "member_force_signed": getattr(res, "member_force_signed", np.zeros((len(edges),), dtype=float)),
                 "member_stress": res.member_stress,
+                "member_buckling_util": getattr(res, "member_buckling_util", np.zeros((len(edges),), dtype=float)),
                 "mass": mass,
                 "tip_disp": tip_disp,
                 "max_sigma": max_sigma,
+                "max_buckling": max_buckling,
                 "lambda2": lambda2,
                 "cond_est": res.cond_est,
                 "intact_connected": intact_connected,
@@ -1443,6 +1484,8 @@ def run_backend(backend_name, settings, results_paths):
                 "damaged_areas": areas_d,
                 "damaged_tip_disp": dam_tip,
                 "damaged_max_sigma": dam_sigma,
+                "damaged_max_buckling": dam_buckling,
+                "damaged_member_buckling_util": getattr(res_d, "member_buckling_util", np.zeros((len(edges_d),), dtype=float)) if res_d is not None else np.zeros((len(edges_d),), dtype=float),
                 "damaged_lambda2": dam_lambda2,
                 "damaged_cond_est": dam_cond,
                 "damaged_connected": damaged_connected,
@@ -1464,6 +1507,7 @@ def run_backend(backend_name, settings, results_paths):
                 f"Iter {it:02d} | backend={backend_name:10s} | edges={len(edges):5d} | mass={mass:8.2f} kg | "
                 f"σ_intact={max_sigma/1e6:7.2f} MPa ({intact_util:5.3f}) | "
                 f"σ_dmg={dam_sigma/1e6 if np.isfinite(dam_sigma) else np.inf:7.2f} MPa ({damaged_util:5.3f}) | "
+                f"buck_i={max_buckling:5.3f} | buck_d={dam_buckling if np.isfinite(dam_buckling) else np.inf:5.3f} | "
                 f"u_tip={tip_disp:8.4e} m | u_tip_d={dam_tip:8.4e} m | "
                 f"cond_i={res.cond_est:.3e} cond_d={dam_cond:.3e} | {damage_reason}"
             )
@@ -1473,6 +1517,8 @@ def run_backend(backend_name, settings, results_paths):
             hist["tip_damaged"].append(dam_tip)
             hist["sigma_intact"].append(max_sigma / 1e6)
             hist["sigma_damaged"].append(dam_sigma / 1e6 if np.isfinite(dam_sigma) else np.nan)
+            hist["buckling_intact"].append(max_buckling)
+            hist["buckling_damaged"].append(dam_buckling if np.isfinite(dam_buckling) else np.nan)
             hist["n_edges"].append(len(edges))
             hist["pruned_count_prev"].append(len(prev_prune_removed_edge_coords))
 
@@ -1485,6 +1531,9 @@ def run_backend(backend_name, settings, results_paths):
                     a_max,
                     shrink_factor=optimization_settings["shrink_factor"],
                     grow_factor=optimization_settings["grow_factor"],
+                    buckling_util=getattr(res, "member_buckling_util", None),
+                    buckling_allow=buckling_allow,
+                    shrink_below=buckling_settings.get("shrink_below", 0.20),
                 )
             else:
                 areas_after_sizing = areas.copy()
@@ -1508,6 +1557,8 @@ def run_backend(backend_name, settings, results_paths):
                     lattice_type=lattice_type,
                     optimization_settings=optimization_settings,
                     density=density,
+                    buckling_enable=buckling_enable,
+                    buckling_allow=buckling_allow,
                     iteration_index=it,
                 )
             else:
