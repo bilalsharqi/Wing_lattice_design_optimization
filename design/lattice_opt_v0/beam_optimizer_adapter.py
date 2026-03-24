@@ -10,8 +10,7 @@ def _expand_force_vector_to_beam(force_vector, n_nodes):
     if f.size != 3 * n_nodes:
         raise ValueError(f"Expected 3N or 6N force vector for beam adapter, got {f.size}")
     fb = np.zeros(6 * n_nodes, dtype=float)
-    for n in range(n_nodes):
-        fb[6*n:6*n+3] = f[3*n:3*n+3]
+    fb.reshape(n_nodes, 6)[:, :3] = f.reshape(n_nodes, 3)
     return fb
 
 
@@ -21,10 +20,7 @@ def _expand_fixed_dofs_to_beam(fixed_dofs, n_nodes):
         return fd
     if np.max(fd) < 3 * n_nodes:
         nodes = np.unique(fd // 3)
-        out = []
-        for n in nodes:
-            out.extend([6*n + 0, 6*n + 1, 6*n + 2, 6*n + 3, 6*n + 4, 6*n + 5])
-        return np.unique(np.asarray(out, dtype=int))
+        return (6 * nodes[:, None] + np.arange(6, dtype=int)[None, :]).ravel()
     return fd
 
 

@@ -20,41 +20,48 @@ def assemble_truss_stiffness(nodes, edges, areas, e_modulus):
     n_nodes = nodes.shape[0]
     n_edges = edges.shape[0]
 
-    rows, cols, data = [], [], []
-    lengths = np.zeros(n_edges)
-    dirs = np.zeros((n_edges, 3))
+    p = nodes[edges[:, 0]]
+    q = nodes[edges[:, 1]]
+    d = q - p
+    lengths = np.linalg.norm(d, axis=1)
+    if np.any(lengths < 1e-12):
+        bad = int(np.where(lengths < 1e-12)[0][0])
+        raise ValueError(f"Zero-length edge at {bad}")
+    dirs = d / lengths[:, None]
 
-    for e, (i, j) in enumerate(edges):
-        d = nodes[j] - nodes[i]
-        L = np.linalg.norm(d)
-        if L < 1e-12:
-            raise ValueError(f"Zero-length edge at {e}")
-        n = d / L
-        lengths[e] = L
-        dirs[e] = n
+    kfac = (e_modulus * areas / lengths)[:, None, None]
+    nnT = dirs[:, :, None] * dirs[:, None, :]
+    k11 = kfac * nnT
+    k12 = -k11
 
-        k = (e_modulus * areas[e] / L)
-        nnT = np.outer(n, n)
-        k11 = +k * nnT
-        k12 = -k * nnT
+    dofi = np.stack([3 * edges[:, 0], 3 * edges[:, 0] + 1, 3 * edges[:, 0] + 2], axis=1)
+    dofj = np.stack([3 * edges[:, 1], 3 * edges[:, 1] + 1, 3 * edges[:, 1] + 2], axis=1)
 
-        dofi = [3 * i, 3 * i + 1, 3 * i + 2]
-        dofj = [3 * j, 3 * j + 1, 3 * j + 2]
+    row_ii = np.repeat(dofi, 3, axis=1)
+    col_ii = np.tile(dofi, (1, 3))
+    row_ij = np.repeat(dofi, 3, axis=1)
+    col_ij = np.tile(dofj, (1, 3))
+    row_ji = np.repeat(dofj, 3, axis=1)
+    col_ji = np.tile(dofi, (1, 3))
+    row_jj = np.repeat(dofj, 3, axis=1)
+    col_jj = np.tile(dofj, (1, 3))
 
-        for a in range(3):
-            for b in range(3):
-                rows.append(dofi[a]); cols.append(dofi[b]); data.append(k11[a, b])
-                rows.append(dofi[a]); cols.append(dofj[b]); data.append(k12[a, b])
-                rows.append(dofj[a]); cols.append(dofi[b]); data.append(k12[a, b])
-                rows.append(dofj[a]); cols.append(dofj[b]); data.append(k11[a, b])
+    rows = np.concatenate([row_ii, row_ij, row_ji, row_jj], axis=1).ravel()
+    cols = np.concatenate([col_ii, col_ij, col_ji, col_jj], axis=1).ravel()
+    data = np.concatenate(
+        [k11.reshape(n_edges, 9), k12.reshape(n_edges, 9), k12.reshape(n_edges, 9), k11.reshape(n_edges, 9)],
+        axis=1,
+    ).ravel()
 
     K = sp.coo_matrix((data, (rows, cols)), shape=(3 * n_nodes, 3 * n_nodes)).tocsr()
     return K, lengths, dirs
 
 
 def apply_dirichlet_bc(K, f, fixed_dofs):
-    all_dofs = np.arange(K.shape[0])
-    free = np.setdiff1d(all_dofs, np.unique(fixed_dofs))
+    fixed = np.unique(np.asarray(fixed_dofs, dtype=int))
+    mask = np.ones(K.shape[0], dtype=bool)
+    mask[fixed] = False
+    free = np.where(mask)[0]
     return K[free][:, free].tocsr(), f[free], free
 
 
@@ -112,17 +119,11 @@ def solve_truss(nodes, edges, areas, e_modulus, f, fixed_dofs, wing, regularizat
     u = np.zeros(K.shape[0])
     u[free] = uf
 
-    n_edges = edges.shape[0]
-    member_force = np.zeros(n_edges)
-    member_stress = np.zeros(n_edges)
-
-    for e, (i, j) in enumerate(edges):
-        ui = u[3 * i:3 * i + 3]
-        uj = u[3 * j:3 * j + 3]
-        axial = np.dot((uj - ui), dirs[e])
-        N_e = (e_modulus * areas[e] / lengths[e]) * axial
-        member_force[e] = N_e
-        member_stress[e] = N_e / max(areas[e], 1e-16)
+    ui = u.reshape(-1, 3)[edges[:, 0]]
+    uj = u.reshape(-1, 3)[edges[:, 1]]
+    axial = np.einsum("ij,ij->i", (uj - ui), dirs)
+    member_force = (e_modulus * areas / lengths) * axial
+    member_stress = member_force / np.maximum(areas, 1e-16)
 
     if tip_node_idx is None:
         tip_node_idx = choose_tip_node(nodes, wing)

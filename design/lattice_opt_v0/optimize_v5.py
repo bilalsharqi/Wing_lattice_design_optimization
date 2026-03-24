@@ -4,7 +4,6 @@
 import os
 import json
 import shutil
-import importlib
 from datetime import datetime
 
 import numpy as np
@@ -14,8 +13,12 @@ import h5py
 import imageio.v2 as imageio
 
 from wingbox_domain import WingBox
-from load_mapping import distributed_vertical_load_to_nodes
 from truss_solver import choose_tip_node
+from solver_interface import (
+    get_solver_function,
+    extract_translation_u,
+    build_force_vector,
+)
 from damage_models import filter_to_root_connected_intact, damage_and_check_full_connectivity
 from gt_metrics import is_connected_safe, algebraic_connectivity_safe, edge_betweenness_stats
 try:
@@ -438,57 +441,6 @@ def write_settings_meta(meta_group, settings, results_paths=None, backend_name=N
         for k, v in results_paths.items():
             _write_h5_value(paths_group, k, v)
 
-
-def get_solver_function(backend_name):
-    backend_name = backend_name.lower().strip()
-    if backend_name == "truss":
-        return importlib.import_module("truss_solver").solve_truss
-    elif backend_name == "responsegt":
-        return importlib.import_module("ResGT_optimizer_adapter").solve_truss
-    elif backend_name == "beam":
-        return importlib.import_module("beam_optimizer_adapter").solve_truss
-    else:
-        raise ValueError(f"Unknown solver backend '{backend_name}'")
-
-
-def _extract_translation_u(u: np.ndarray, n_nodes: int) -> np.ndarray:
-    """Return (n_nodes,3) translations from either 3N (truss/ResGT) or 6N (beam) DOF vectors."""
-    u = np.asarray(u).reshape(-1)
-    if u.size == 3 * n_nodes:
-        return u.reshape(n_nodes, 3)
-    if u.size == 6 * n_nodes:
-        return u.reshape(n_nodes, 6)[:, :3]
-    raise ValueError(
-        f"Unexpected displacement size {u.size}; expected {3*n_nodes} (truss) or {6*n_nodes} (beam)"
-    )
-
-
-
-def build_force_vector(nodes, wing, total_lift, backend_name, physics_settings, distribution="elliptic"):
-    """
-    Build solver load vector.
-    - truss / responsegt: 3N translational force vector
-    - beam: 6N vector with same translational forces plus a spanwise torsional moment
-      My = -(elastic_axis_x - x_cp) * Fz
-    """
-    f3 = distributed_vertical_load_to_nodes(nodes, wing.span, total_lift, distribution=distribution)
-    if backend_name.lower().strip() != "beam":
-        return f3
-
-    n_nodes = nodes.shape[0]
-    f6 = np.zeros(6 * n_nodes, dtype=float)
-    for n in range(n_nodes):
-        f6[6*n:6*n+3] = f3[3*n:3*n+3]
-
-    if physics_settings.get("excite_torsion", False):
-        elastic_axis_x = float(physics_settings.get("elastic_axis_x_frac", 0.35)) * float(wing.chord)
-        x_cp = float(physics_settings.get("x_cp_frac", 0.25)) * float(wing.chord)
-        dx = elastic_axis_x - x_cp 
-        for n in range(n_nodes):
-            Fz = f6[6*n + 2]
-            # r x F with r=(dx,0,0), F=(0,0,Fz) -> My = -dx * Fz
-            f6[6*n + 4] += -dx * Fz
-    return f6
 
 def choose_ebc_weight_mode(lattice_type, optimization_settings):
     mode = optimization_settings.get("ebc_weight_mode", "auto")
@@ -1305,7 +1257,7 @@ def run_backend(backend_name, settings, results_paths):
             lambda2 = algebraic_connectivity_safe(len(nodes), edges)
             ebc_stats = edge_betweenness_stats(len(nodes), edges)
 
-            u_xyz = _extract_translation_u(res.u, nodes.shape[0])
+            u_xyz = extract_translation_u(res.u, nodes.shape[0])
             nodes_def = nodes + settings["output"]["deformation_scale"] * u_xyz
             tip_coord_def = nodes_def[tip_node_idx]
             max_span_coord_def = nodes_def[max_span_node_idx]
@@ -1372,7 +1324,7 @@ def run_backend(backend_name, settings, results_paths):
                         dam_tip = float(res_d.tip_disp)
                         dam_sigma = float(np.max(np.abs(res_d.member_stress)))
                         dam_buckling = float(np.max(res_d.member_buckling_util)) if hasattr(res_d, "member_buckling_util") else np.nan
-                        u_d_xyz = _extract_translation_u(res_d.u, nodes_d.shape[0])
+                        u_d_xyz = extract_translation_u(res_d.u, nodes_d.shape[0])
                         nodes_d_def = nodes_d + settings["output"]["deformation_scale"] * u_d_xyz
                         dam_tip_coord_def = nodes_d_def[dam_tip_node_idx]
                         dam_max_span_coord_def = nodes_d_def[dam_max_span_node_idx]
