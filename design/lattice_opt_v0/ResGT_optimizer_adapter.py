@@ -2,7 +2,7 @@
 import numpy as np
 from dataclasses import dataclass
 from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import spsolve, eigsh
 
 
 @dataclass
@@ -103,7 +103,12 @@ def solve_responsegt(
     member_stress = member_force / areas
 
     try:
-        cond_est = np.linalg.cond(Kff.toarray())
+        if Kff.shape[0] < 2:
+            cond_est = np.inf
+        else:
+            lam_max = float(eigsh(Kff, k=1, which="LM", return_eigenvectors=False)[0])
+            lam_min = float(eigsh(Kff, k=1, which="SM", return_eigenvectors=False)[0])
+            cond_est = (lam_max / lam_min) if lam_min > 0.0 else np.inf
     except Exception:
         cond_est = np.inf
 
